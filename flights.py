@@ -20,7 +20,6 @@ SEARCH = {
     "destination": "BKK",
     "departure_date": "2026-08-17",
     "return_date": "2026-09-04",
-    "cabin": "ECONOMY",
 }
 
 # ============================================================
@@ -327,7 +326,7 @@ def build_payload(origin, destination, departure_date):
                 "isRequested": True,
             },
         ],
-        "cabinClass": SEARCH["cabin"],
+        "cabinClass": "ECONOMY",
         "ignoreInvalidPromoCode": True,
         "passengers": [{"type": "ADT", "count": 1}],
     }
@@ -899,7 +898,6 @@ def parse_args(argv=None):
     p.add_argument("--destination", "-d", type=str, default=None, metavar="CODE", help="Destination airport IATA (default: BKK)")
     p.add_argument("--depart", type=str, default=None, metavar="YYYY-MM-DD", help="Departure date (default: 2026-08-17)")
     p.add_argument("--ret", type=str, default=None, metavar="YYYY-MM-DD", help="Return date (default: 2026-09-04)")
-    p.add_argument("--cabin", type=str, default=None, choices=["ECONOMY", "BUSINESS"], help="Cabin class (default: ECONOMY)")
     return p.parse_args(argv)
 
 
@@ -1382,7 +1380,7 @@ def print_booking_links(results):
     if pairs:
         console.print("\n[bold]Booking links:[/bold]")
         for origin, dest, dep, ret in sorted(pairs):
-            url = booking_url(origin, dest, dep, ret, SEARCH.get("cabin", "ECONOMY"))
+            url = booking_url(origin, dest, dep, ret, "ECONOMY")
             console.print(f"  {dep} \u2192 {ret}  {url}")
 
 
@@ -1432,9 +1430,6 @@ def main():
         SEARCH["departure_date"] = args.depart
     if args.ret:
         SEARCH["return_date"] = args.ret
-    if args.cabin:
-        SEARCH["cabin"] = args.cabin.upper()
-
     # Validate dates
     try:
         ob_date = datetime.strptime(SEARCH["departure_date"], "%Y-%m-%d")
@@ -1468,7 +1463,6 @@ def main():
         f"[bold]Search:[/bold] {SEARCH['origin']} \u2192 {SEARCH['destination']}"
         f"  [bold]Dates:[/bold] {SEARCH['departure_date']} \u2192 {SEARCH['return_date']}"
         f"  [bold]Max dur:[/bold] {max_dur}h"
-        f"  [bold]Cabin:[/bold] {SEARCH['cabin']}"
     )
 
     # determine scan mode

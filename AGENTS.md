@@ -9,7 +9,7 @@ This is a **Qatar Airways flight price scanner**. It queries the QR BFF API to f
 ## Key concepts
 
 - **API**: POST `https://www.qatarairways.com/dapi/public/bff/web/flight-search/flight-offers` — session auth via browser headers (refresh with `--paste`, expires ~24h)
-- **Search**: outbound + return are **separate API calls** (one itinerary per request)
+- **Search**: outbound + return are **separate API calls** (one itinerary per request). API always sends `cabinClass: "ECONOMY"` — confirmed via browser testing that this returns BOTH economy and business fares in the response. No `--cabin` flag exists.
 - **Cabin + fare filtering**: `PREFERENCES` dict controls which fare families/cabins are shown; `ALWAYS_EXCLUDED` removes LITE/ELITE by default
 - **Drift scanning** (`--drift N`): shift both dates ±N days preserving trip length. `--drift-ret N`: shift only return date
 - **Price map** (`--price-map`): day-of-week trends stored in `price_map.json`

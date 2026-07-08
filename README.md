@@ -25,7 +25,6 @@ Flags:
   -d, --destination CODE    Destination airport (default: BKK)
   --depart YYYY-MM-DD       Outbound date (default: 2026-08-17)
   --ret YYYY-MM-DD          Return date (default: 2026-09-04)
-  --cabin CABIN             Cabin class: ECONOMY, BUSINESS (default: ECONOMY)
   --drift N                 Shift both dates ±N days, preserve trip length
   --drift-ret N             Shift return date ±N days, keep outbound fixed
   --scan                    Scan a range of outbound dates
@@ -41,6 +40,7 @@ Flags:
   --flag-bad DIR DAY REASON Manually flag a bad pattern
   --price-map               Show day-of-week price trends
   --paste                   Paste new browser headers
+  --urls                    Show booking links
   --nocache                 Bypass offers cache
   --json                    Output raw JSON
   --delay SEC               Delay between API calls
