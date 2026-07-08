@@ -835,6 +835,21 @@ def fetch_flights(headers, cookies, origin, destination, departure_date):
     return data, resp.status_code, None
 
 
+def _fetch_and_parse(headers, cookies, origin, destination, date_str, dep_date, ret_date, direction, max_dur):
+    data, status, err = fetch_flights(headers, cookies, origin, destination, date_str)
+    if data is None:
+        log.print(f"[red]  HTTP {status}: {err}[/red]")
+        return []
+    results = parse_results(data, max_dur)
+    convert_prices(results)
+    for r in results:
+        r["_dep_date"] = dep_date
+        r["_ret_date"] = ret_date
+        r["_direction"] = direction
+    log.print(f"  [green]\u2192 {len(results)} offers[/green]")
+    return results
+
+
 # ============================================================
 # CLI
 # ============================================================
@@ -914,18 +929,10 @@ def scan_outbound(headers, cookies, args, max_price, weight, max_dur, top_n, raw
         if (ret - d).days < min_trip:
             log.print(f"[dim]Skipping {d}: trip={(ret-d).days}d < min {min_trip}d[/dim]")
             continue
+        ob_str = d.isoformat()
         log.print(f"[cyan]Outbound request {idx+1}/{total}: {d}[/cyan]")
-        data, status, err = fetch_flights(headers, cookies, SEARCH["origin"], SEARCH["destination"], d.isoformat())
-        if data is None:
-            log.print(f"[red]  HTTP {status}: {err}[/red]")
-        else:
-            results = parse_results(data, max_dur)
-            convert_prices(results)
-            for r in results:
-                r["_dep_date"] = d.isoformat()
-                r["_ret_date"] = ret.isoformat()
-            all_results.extend(results)
-            log.print(f"  [green]\u2192 {len(results)} offers[/green]")
+        results = _fetch_and_parse(headers, cookies, SEARCH["origin"], SEARCH["destination"], ob_str, ob_str, ret.isoformat(), "OB", max_dur)
+        all_results.extend(results)
         if idx < total - 1:
             next_d = dates_to_check[idx + 1].isoformat()
             if not _is_cache_hit(SEARCH["origin"], SEARCH["destination"], next_d):
@@ -967,18 +974,10 @@ def scan_return(headers, cookies, args, max_price, weight, max_dur, top_n, raw=F
         if (d - dep).days < min_trip:
             log.print(f"[dim]Skipping {d}: trip={(d-dep).days}d < min {min_trip}d[/dim]")
             continue
+        rb_str = d.isoformat()
         log.print(f"[cyan]Return request {idx+1}/{total}: {d}[/cyan]")
-        data, status, err = fetch_flights(headers, cookies, SEARCH["destination"], SEARCH["origin"], d.isoformat())
-        if data is None:
-            log.print(f"[red]  HTTP {status}: {err}[/red]")
-        else:
-            results = parse_results(data, max_dur)
-            convert_prices(results)
-            for r in results:
-                r["_dep_date"] = dep.isoformat()
-                r["_ret_date"] = d.isoformat()
-            all_results.extend(results)
-            log.print(f"  [green]\u2192 {len(results)} offers[/green]")
+        results = _fetch_and_parse(headers, cookies, SEARCH["destination"], SEARCH["origin"], rb_str, dep.isoformat(), rb_str, "RB", max_dur)
+        all_results.extend(results)
         if idx < total - 1:
             next_d = dates_to_check[idx + 1].isoformat()
             if not _is_cache_hit(SEARCH["destination"], SEARCH["origin"], next_d):
@@ -1031,34 +1030,14 @@ def drift_scan(headers, cookies, args, max_price, max_dur):
         rb_str = rb_date.isoformat()
         log.print(f"[cyan]Drift {idx+1}/{total}: {ob_date} \u2192 {rb_date} ({trip_days}d trip)[/cyan]")
 
-        data, status, err = fetch_flights(headers, cookies, SEARCH["origin"], SEARCH["destination"], ob_str)
-        if data:
-            results = parse_results(data, max_dur)
-            convert_prices(results)
-            for r in results:
-                r["_dep_date"] = ob_str
-                r["_ret_date"] = rb_str
-                r["_direction"] = "OB"
-            all_results.extend(results)
-            log.print(f"  [green]Outbound: {len(results)} offers[/green]")
-        else:
-            log.print(f"[red]  Outbound: HTTP {status}[/red]")
+        results = _fetch_and_parse(headers, cookies, SEARCH["origin"], SEARCH["destination"], ob_str, ob_str, rb_str, "OB", max_dur)
+        all_results.extend(results)
 
         if not _is_cache_hit(SEARCH["destination"], SEARCH["origin"], rb_str):
             time.sleep(delay)
 
-        data, status, err = fetch_flights(headers, cookies, SEARCH["destination"], SEARCH["origin"], rb_str)
-        if data:
-            results = parse_results(data, max_dur)
-            convert_prices(results)
-            for r in results:
-                r["_dep_date"] = ob_str
-                r["_ret_date"] = rb_str
-                r["_direction"] = "RB"
-            all_results.extend(results)
-            log.print(f"  [green]Return: {len(results)} offers[/green]")
-        else:
-            log.print(f"[red]  Return: HTTP {status}[/red]")
+        results = _fetch_and_parse(headers, cookies, SEARCH["destination"], SEARCH["origin"], rb_str, ob_str, rb_str, "RB", max_dur)
+        all_results.extend(results)
 
         if idx < total - 1:
             next_ob = (base_ob + timedelta(days=offsets[idx + 1])).isoformat()
@@ -1118,34 +1097,14 @@ def drift_scan_return(headers, cookies, args, max_price, max_dur):
 
         log.print(f"[cyan]Drift-Ret {idx+1}/{total}: {ob_date} \u2192 {rb_date} ({trip_days}d trip)[/cyan]")
 
-        data, status, err = fetch_flights(headers, cookies, SEARCH["origin"], SEARCH["destination"], ob_str)
-        if data:
-            results = parse_results(data, max_dur)
-            convert_prices(results)
-            for r in results:
-                r["_dep_date"] = ob_str
-                r["_ret_date"] = rb_str
-                r["_direction"] = "OB"
-            all_results.extend(results)
-            log.print(f"  [green]Outbound: {len(results)} offers[/green]")
-        else:
-            log.print(f"[red]  Outbound: HTTP {status}[/red]")
+        results = _fetch_and_parse(headers, cookies, SEARCH["origin"], SEARCH["destination"], ob_str, ob_str, rb_str, "OB", max_dur)
+        all_results.extend(results)
 
         if not _is_cache_hit(SEARCH["destination"], SEARCH["origin"], rb_str):
             time.sleep(delay)
 
-        data, status, err = fetch_flights(headers, cookies, SEARCH["destination"], SEARCH["origin"], rb_str)
-        if data:
-            results = parse_results(data, max_dur)
-            convert_prices(results)
-            for r in results:
-                r["_dep_date"] = ob_str
-                r["_ret_date"] = rb_str
-                r["_direction"] = "RB"
-            all_results.extend(results)
-            log.print(f"  [green]Return: {len(results)} offers[/green]")
-        else:
-            log.print(f"[red]  Return: HTTP {status}[/red]")
+        results = _fetch_and_parse(headers, cookies, SEARCH["destination"], SEARCH["origin"], rb_str, ob_str, rb_str, "RB", max_dur)
+        all_results.extend(results)
 
         if idx < total - 1:
             next_rb = (base_rb + timedelta(days=offsets[idx + 1])).isoformat()
@@ -1413,9 +1372,9 @@ def print_drift_summary(merged_results):
             console.print(f"  {'Book:':<14} {url}")
 
 
-def print_booking_links(merged_results):
+def print_booking_links(results):
     pairs = set()
-    for r in merged_results:
+    for r in results:
         dep = r.get("_dep_date") or r.get("departure_date")
         ret = r.get("_ret_date")
         if dep and ret:
@@ -1549,6 +1508,8 @@ def main():
         if args.recommend:
             combos = find_best_mixed(all_results, top_n=args.recommend)
             print_mixed_table(combos)
+        if args.urls:
+            print_booking_links(all_results)
     elif args.drift_ret is not None:
         log.rule("[bold cyan]Drift-Ret scan[/bold cyan]")
         all_results = drift_scan_return(headers, cookies, args, max_price, max_dur)
@@ -1561,6 +1522,8 @@ def main():
         if args.recommend:
             combos = find_best_mixed(all_results, top_n=args.recommend)
             print_mixed_table(combos)
+        if args.urls:
+            print_booking_links(all_results)
     elif in_scan_mode:
         scan_ob = args.ob is not None or (args.scan and args.rb is None)
         scan_rb = args.rb is not None
@@ -1581,6 +1544,10 @@ def main():
             log.print("[yellow]No results after scan + filtering.[/yellow]")
             return
 
+        if not args.nofilter:
+            all_results = filter_results(all_results, max_price, max_dur)
+        all_results = score_results(all_results, weight)[:top_n]
+
         label = (
             f"Scan results"
             f" (max {max_dur}h, max price: {max_price})"
@@ -1599,6 +1566,9 @@ def main():
             sys.exit(1)
         ob_results = parse_results(ob_data, max_dur)
         convert_prices(ob_results)
+        for r in ob_results:
+            r["_dep_date"] = SEARCH["departure_date"]
+            r["_ret_date"] = SEARCH["return_date"]
         ob_results = filter_dirt_cheap(ob_results)
         if not args.nofilter:
             ob_results = filter_results(ob_results, max_price, None)
@@ -1615,6 +1585,9 @@ def main():
             sys.exit(1)
         rb_results = parse_results(rb_data, max_dur)
         convert_prices(rb_results)
+        for r in rb_results:
+            r["_dep_date"] = SEARCH["departure_date"]
+            r["_ret_date"] = SEARCH["return_date"]
         rb_results = filter_dirt_cheap(rb_results)
         if not args.nofilter:
             rb_results = filter_results(rb_results, max_price, None)
@@ -1630,6 +1603,9 @@ def main():
             print_compare_table(ob_merged, title=ob_label, filter_note=filter_note)
             rb_merged = merge_cabins(rb_results)
             print_compare_table(rb_merged, title=rb_label, filter_note=filter_note)
+
+        if args.urls:
+            print_booking_links(ob_results + rb_results)
 
 
 if __name__ == "__main__":
