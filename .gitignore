@@ -1,0 +1,5 @@
+config.json
+currency.json
+offers_cache.json
+price_map.json
+*.results.json
