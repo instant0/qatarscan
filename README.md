@@ -2,8 +2,8 @@
 
 Scrapes the Qatar Airways BFF API to find the cheapest flights between two
 cities, with support for drift scans (varying dates), mixed-cabin
-recommendations (economy one way, business the other), and a price map to
-visualize day-of-week trends.
+recommendations (economy one way, business the other), price calendar,
+trend analysis, and historical cache archiving.
 
 ## Quick start
 
@@ -36,13 +36,17 @@ Flags:
   --nofilter                Disable price filter
   --all-fares               Include BUSINESS_LITE / BUSINESS_ELITE fares
   --recommend [N]           Show top N mixed-cabin combos after drift
-  --filter-bad              Skip API calls for known-bad day+route combos
-  --flag-bad DIR DAY REASON Manually flag a bad pattern
-  --price-map               Show day-of-week price trends
+  --prune-cache             Archive stale cache entries + trim to 1 year
+  --calendar [MONTH YEAR]   Show price calendar (e.g. "Aug 2026")
+  --trends                  Show price trend analysis from collected data
+  --price-map               Show day-of-week price table
   --paste                   Paste new browser headers
   --urls                    Show booking links
   --nocache                 Bypass offers cache
   --json                    Output raw JSON
   --delay SEC               Delay between API calls
   --help                    Show this help
+
+Notes:
+  --calendar and --trends can be combined: python flights.py --trends --calendar
 ```

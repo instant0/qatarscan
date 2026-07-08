@@ -9,12 +9,14 @@ This is a **Qatar Airways flight price scanner**. It queries the QR BFF API to f
 ## Key concepts
 
 - **API**: POST `https://www.qatarairways.com/dapi/public/bff/web/flight-search/flight-offers` — session auth via browser headers (refresh with `--paste`, expires ~24h)
-- **Search**: outbound + return are **separate API calls** (one itinerary per request). API always sends `cabinClass: "ECONOMY"` — confirmed via browser testing that this returns BOTH economy and business fares in the response. No `--cabin` flag exists.
-- **Cabin + fare filtering**: `PREFERENCES` dict controls which fare families/cabins are shown; `ALWAYS_EXCLUDED` removes LITE/ELITE by default
+- **Search**: outbound + return are **separate API calls** (one itinerary per request). API always sends `cabinClass: "ECONOMY"` — returns BOTH economy and business fares. No `--cabin` flag.
+- **Cabin + fare filtering**: `PREFERENCES` dict controls which fare families/cabins are shown; LITE/ELITE hidden by `show_fares` + `filter_dirt_cheap()`
 - **Drift scanning** (`--drift N`): shift both dates ±N days preserving trip length. `--drift-ret N`: shift only return date
 - **Price map** (`--price-map`): day-of-week trends stored in `price_map.json`
+- **Cache archival** (`--prune-cache`): stale entries (previous days) auto-archived to `cache_archive.json`; archive trimmed to 1 year
+- **Price calendar** (`--calendar [MONTH YEAR]`): monthly grid of min fares from price_map + archive; green=cheap, red=expensive
+- **Trend analysis** (`--trends`): cheapest/most expensive day, volatility, fare class distribution; fed by price_map + archive
 - **Mixed-cabin recommendations** (`--recommend`): cheapest economy one way + business the other
-- **Bad-day filter** (`--filter-bad`): skip dates known to have no direct routing (stored in `bad_patterns.json`)
 - **Layout classification**: maps aircraft code → business class layout type for display in results
 
 ## Data files
@@ -24,20 +26,23 @@ This is a **Qatar Airways flight price scanner**. It queries the QR BFF API to f
 | `config.json` | Browser session headers |
 | `layouts.json` | Aircraft code → layout mapping |
 | `price_map.json` | Day-of-week price trends |
-| `offers_cache.json` | Cached API responses |
-| `bad_patterns.json` | Known bad date+direction combos |
+| `offers_cache.json` | Cached API responses (current day only) |
+| `cache_archive.json` | Historical API responses (append log, 1-yr retention) |
 | `currency.json` | FX rates cache |
 | `api.md` | API documentation |
 | `plan.md` | Feature plan / backlog |
 
 ## Key code locations
 
-- `classify_layout()` (line 116): maps aircraft code → layout ("QSuite", "Door", "Pod", "Old", "Unknown")
-- `parse_results()` (line 341): parses API response into segment objects, calls classify_layout per segment
-- `fetch_offers()` (line 788): makes the HTTP request, handles caching
-- `find_best_mixed()` (line 1285): mixed-cabin matcher
-- `is_bad_day()` (line 1251): bad-day filter
-- `LAYOUT_RANK` (line 102): QSuite=4, Door=3, Pod=2, Old=1, Unknown=0
+- `classify_layout()`: maps aircraft code → layout ("QSuite", "Door", "Pod", "Old", "Unknown")
+- `parse_results()`: parses API response into segment objects, calls classify_layout per segment
+- `fetch_flights()`: makes HTTP request, handles offers cache
+- `archive_stale_cache()`: moves previous-day entries to `cache_archive.json`, prunes >365d
+- `_load_archive_prices()`: parses archive into `{date: {direction: {fare: price}}}` for calendar/trends
+- `print_price_calendar()`: monthly grid with green/yellow/red color coding
+- `print_price_trends()`: day-of-week breakdown with volatility stats
+- `find_best_mixed()`: mixed-cabin matcher
+- `update_price_map()`: aggregates per-day-of-week price data into `price_map.json`
 
 ---
 

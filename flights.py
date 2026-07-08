@@ -35,12 +35,9 @@ PREFERENCES = {
         "BUSINESS_CLASSIC",
         "BUSINESS_COMFORT",
     ],
-    "highlight_fares": ["ECONOMY_CLASSIC", "BUSINESS_CLASSIC"],
     "avoid_airports": ["LHR", "LGW", "HEL", "KUL"],
     "max_stops": 1,
 }
-
-ALWAYS_EXCLUDED = {"ECONOMY_LITE", "FIRST_ELITE"}
 
 ALL_FARES = [
     "ECONOMY_CLASSIC",
@@ -96,8 +93,8 @@ LAYOUTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "layouts
 CURRENCY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "currency.json")
 OFFERS_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "offers_cache.json")
 PRICE_MAP_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "price_map.json")
-BAD_PATTERNS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bad_patterns.json")
-
+CACHE_ARCHIVE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache_archive.json")
+ARCHIVE_MAX_DAYS = 365
 LAYOUT_RANK = {"QSuite": 4, "Door": 3, "Pod": 2, "Old": 1, "Unknown": 0}
 
 
@@ -576,6 +573,250 @@ def print_price_map():
 
 
 # ============================================================
+# ARCHIVE PRICE LOADER (historical per-date prices from cache_archive.json)
+# ============================================================
+
+
+def _load_archive_prices():
+    if not os.path.exists(CACHE_ARCHIVE_FILE):
+        return {}
+    with open(CACHE_ARCHIVE_FILE) as f:
+        archive = json.load(f)
+    per_date = {}
+    for a in archive:
+        entry = a.get("entry", {})
+        data = entry.get("data")
+        if not data:
+            continue
+        parts = a.get("key", "").split("_")
+        if len(parts) < 3:
+            continue
+        origin, destination = parts[0], parts[1]
+        date_str = "_".join(parts[2:])
+        direction_dir = f"{origin}_{destination}"
+        try:
+            parsed = parse_results(data)
+        except Exception:
+            continue
+        convert_prices(parsed)
+        for r in parsed:
+            fare = r.get("fare")
+            price = r.get("price")
+            if not fare or price is None:
+                continue
+            per_date.setdefault(date_str, {}).setdefault(direction_dir, {}).setdefault(fare, []).append(price)
+    result = {}
+    for date_str, directions in per_date.items():
+        result[date_str] = {}
+        for direction_dir, fares in directions.items():
+            result[date_str][direction_dir] = {}
+            for fare, prices in fares.items():
+                result[date_str][direction_dir][fare] = sum(prices) // len(prices)
+    return result
+
+
+# ============================================================
+# PRICE CALENDAR (monthly grid from price_map.json + archive)
+# ============================================================
+
+
+def _parse_calendar_arg(raw):
+    if not raw or raw == "current":
+        now = datetime.now()
+        return now.year, now.month
+    parts = raw.split()
+    if len(parts) == 2:
+        month_str, year_str = parts
+        months = {
+            "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+            "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+        }
+        month = months.get(month_str.lower()[:3])
+        year = int(year_str)
+        if month:
+            return year, month
+    if len(parts) == 1 and parts[0].isdigit() and 1 <= int(parts[0]) <= 12:
+        now = datetime.now()
+        return now.year, int(parts[0])
+    raise ValueError(f"Could not parse '{raw}' — use e.g. 'Aug 2026'")
+
+
+def _min_fare_for_date(price_data, direction, date_str, fare_filter, archive_prices=None):
+    if archive_prices:
+        archive_entry = archive_prices.get(date_str, {}).get(direction, {})
+        if archive_entry:
+            best = None
+            for fare, price in archive_entry.items():
+                if fare_filter and fare not in fare_filter:
+                    continue
+                if best is None or price < best:
+                    best = price
+            if best is not None:
+                return best
+    day_name = datetime.strptime(date_str, "%Y-%m-%d").strftime("%a")
+    day_data = price_data.get(direction, {}).get(day_name, {})
+    best = None
+    for pat_key, pat in day_data.items():
+        for fcode, fdata in pat.get("fares", {}).items():
+            if fare_filter and fcode not in fare_filter:
+                continue
+            avg = fdata["total"] // fdata["samples"]
+            if best is None or avg < best:
+                best = avg
+    return best
+
+
+def print_price_calendar(year, month, origin, destination, fare_filter=None, archive_prices=None):
+    if not os.path.exists(PRICE_MAP_FILE):
+        console.print("[yellow]No price map data yet. Run a drift or scan first.[/yellow]")
+        return
+    with open(PRICE_MAP_FILE) as f:
+        data = json.load(f)
+
+    direction = f"{origin}_{destination}"
+    rev_direction = f"{destination}_{origin}"
+
+    import calendar as cal_mod
+    first_day, days_in_month = cal_mod.monthrange(year, month)
+    month_name = datetime(year, month, 1).strftime("%B %Y")
+
+    for lbl, dkey in [(f"{origin} \u2192 {destination}", direction), (f"{destination} \u2192 {origin}", rev_direction)]:
+        has_data = dkey in data or (archive_prices and any(a.get(dkey) for a in archive_prices.values()))
+        if not has_data:
+            continue
+        console.print(f"\n[bold]{month_name} \u2014 {lbl}[/bold]")
+        W = 6
+        console.print("".join(f"  {d:<{W-2}}" for d in ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]), style="dim")
+
+        all_prices = []
+        for day in range(1, days_in_month + 1):
+            ds = f"{year}-{month:02d}-{day:02d}"
+            p = _min_fare_for_date(data, dkey, ds, fare_filter, archive_prices)
+            all_prices.append(p)
+
+        valid = [p for p in all_prices if p is not None]
+        if not valid:
+            console.print("   No data for this month\n")
+            continue
+        avg_price = sum(valid) / len(valid)
+
+        def color(p):
+            if p is None:
+                return " " * W
+            s = f"{p:>{W}}"
+            if p < avg_price * 0.9:
+                return f"[green]{s}[/green]"
+            elif p > avg_price * 1.1:
+                return f"[red]{s}[/red]"
+            return s
+
+        line = " " * (W * first_day)
+        for day in range(1, days_in_month + 1):
+            line += color(all_prices[day - 1])
+            if (first_day + day) % 7 == 0:
+                console.print(line)
+                line = ""
+        if line.strip():
+            console.print(line)
+        console.print()
+
+
+# ============================================================
+# TREND ANALYSIS (from price_map.json + archive)
+# ============================================================
+
+
+def print_price_trends(origin, destination, archive_prices=None):
+    if not os.path.exists(PRICE_MAP_FILE):
+        console.print("[yellow]No price map data yet. Run a drift or scan first.[/yellow]")
+        return
+    with open(PRICE_MAP_FILE) as f:
+        price_map = json.load(f)
+
+    direction = f"{origin}_{destination}"
+    rev_direction = f"{destination}_{origin}"
+
+    for lbl, dkey in [(f"{origin} \u2192 {destination}", direction), (f"{destination} \u2192 {origin}", rev_direction)]:
+        day_data = price_map.get(dkey, {})
+        has_archive = archive_prices and any(a.get(dkey) for a in archive_prices.values())
+        if not day_data and not has_archive:
+            continue
+        console.print(f"\n[bold]Price Trends \u2014 {lbl}[/bold]")
+
+        day_order = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+        day_stats = {}
+        all_fares = {}
+        all_prices = []
+
+        for day_name, patterns in day_data.items():
+            totals = []
+            for pat_key, pat in patterns.items():
+                for fcode, fdata in pat.get("fares", {}).items():
+                    avg = fdata["total"] // fdata["samples"]
+                    totals.append(avg)
+                    all_fares.setdefault(fcode, 0)
+                    all_fares[fcode] += fdata["samples"]
+                    all_prices.append(avg)
+            if totals:
+                day_stats[day_name] = {
+                    "avg": sum(totals) // len(totals),
+                    "min": min(totals),
+                    "max": max(totals),
+                    "count": len(totals),
+                }
+
+        if archive_prices:
+            for date_str, directions in archive_prices.items():
+                if dkey not in directions:
+                    continue
+                day_name = datetime.strptime(date_str, "%Y-%m-%d").strftime("%a")
+                for fare, price in directions[dkey].items():
+                    all_fares.setdefault(fare, 0)
+                    all_fares[fare] += 1
+                    all_prices.append(price)
+                    if day_name not in day_stats:
+                        day_stats[day_name] = {"avg": price, "min": price, "max": price, "count": 1}
+                    else:
+                        s = day_stats[day_name]
+                        s["min"] = min(s["min"], price)
+                        s["max"] = max(s["max"], price)
+                        s["total"] = s.get("total", s["avg"] * s["count"]) + price
+                        s["count"] += 1
+                        s["avg"] = s["total"] // s["count"]
+
+        if not day_stats:
+            console.print("   No data\n")
+            continue
+
+        best_day = min(day_order, key=lambda d: day_stats.get(d, {}).get("avg", 999999))
+        worst_day = max(day_order, key=lambda d: day_stats.get(d, {}).get("avg", 0))
+
+        console.print(f"   Cheapest day:  [green]{best_day}[/green] (avg {day_stats[best_day]['avg']})" if best_day in day_stats else "")
+        console.print(f"   Most expensive: [red]{worst_day}[/red] (avg {day_stats[worst_day]['avg']})" if worst_day in day_stats else "")
+
+        if all_prices:
+            avg_p = sum(all_prices) // len(all_prices)
+            stddev = (sum((p - avg_p) ** 2 for p in all_prices) / len(all_prices)) ** 0.5
+            vol = (stddev / avg_p) * 100 if avg_p else 0
+            console.print(f"   Volatility:     \u00b1{vol:.1f}%")
+
+        console.print(f"   Fare classes:  {', '.join(sorted(all_fares.keys()))}" if all_fares else "")
+
+        table = Table(box=SIMPLE_HEAVY, header_style="bold cyan")
+        table.add_column("Day", style="white")
+        table.add_column("Avg", justify="right", style="yellow")
+        table.add_column("Min", justify="right", style="green")
+        table.add_column("Max", justify="right", style="red")
+        table.add_column("Samples", justify="right", style="dim")
+        for d in day_order:
+            if d not in day_stats:
+                continue
+            s = day_stats[d]
+            table.add_row(d, str(s["avg"]), str(s["min"]), str(s["max"]), str(s["count"]))
+        console.print(table)
+
+
+# ============================================================
 # MERGE CABINS (group economy + business by itinerary)
 # ============================================================
 
@@ -765,17 +1006,11 @@ def print_json_combined(data):
 # ============================================================
 
 _nocache = False
-_filter_bad = False
 
 
 def set_nocache(val):
     global _nocache
     _nocache = val
-
-
-def set_filter_bad(val):
-    global _filter_bad
-    _filter_bad = val
 
 
 def load_offers_cache():
@@ -788,6 +1023,40 @@ def load_offers_cache():
 def save_offers_cache(cache):
     with open(OFFERS_CACHE_FILE, "w") as f:
         json.dump(cache, f, indent=2)
+
+
+def archive_stale_cache():
+    if not os.path.exists(OFFERS_CACHE_FILE):
+        return 0
+    with open(OFFERS_CACHE_FILE) as f:
+        cache = json.load(f)
+    if not cache:
+        return 0
+    today = datetime.now().strftime("%Y-%m-%d")
+    stale = {}
+    fresh = {}
+    for key, entry in cache.items():
+        if entry.get("date", "") < today:
+            stale[key] = entry
+        else:
+            fresh[key] = entry
+    archive = []
+    if os.path.exists(CACHE_ARCHIVE_FILE):
+        with open(CACHE_ARCHIVE_FILE) as f:
+            try:
+                archive = json.load(f)
+            except (json.JSONDecodeError, OSError):
+                archive = []
+    now = datetime.now().isoformat()
+    for key, entry in stale.items():
+        archive.append({"archived_at": now, "key": key, "entry": entry})
+    cutoff = (datetime.now() - timedelta(days=ARCHIVE_MAX_DAYS)).strftime("%Y-%m-%d")
+    archive = [a for a in archive if a.get("entry", {}).get("date", "") >= cutoff]
+    with open(CACHE_ARCHIVE_FILE, "w") as f:
+        json.dump(archive, f, indent=2)
+    with open(OFFERS_CACHE_FILE, "w") as f:
+        json.dump(fresh, f, indent=2)
+    return len(stale)
 
 
 # ============================================================
@@ -891,9 +1160,10 @@ def parse_args(argv=None):
     p.add_argument("--delay", type=int, default=None, metavar="SEC", help="Delay between scan requests (default 10 for drift, 20 for scan)")
     p.add_argument("--price-map", action="store_true", help="Show price map (day-of-week price trends from collected data)")
     p.add_argument("--recommend", type=int, default=None, const=10, nargs="?", metavar="N", help="Show top N mixed-cabin combos (default 10)")
-    p.add_argument("--filter-bad", action="store_true", help="Skip API calls for known-bad day-of-week + direction combos")
-    p.add_argument("--flag-bad", type=str, default=None, nargs=3, metavar=("DIRECTION", "DAY", "REASON"), help="Flag a bad pattern: OSL_BKK Mon 'expensive'")
     p.add_argument("--all-fares", action="store_true", help="Include BUSINESS_LITE, BUSINESS_ELITE (excluded by default; ECONOMY_LITE/FIRST always hidden)")
+    p.add_argument("--prune-cache", action="store_true", help="Archive stale cache entries (older than 30 days)")
+    p.add_argument("--calendar", type=str, default=None, const="current", nargs="?", metavar="MONTH YEAR", help="Show price calendar for a month (e.g. 'Aug 2026', default: current month)")
+    p.add_argument("--trends", action="store_true", help="Show price trend analysis from collected data")
     p.add_argument("--origin", "-o", type=str, default=None, metavar="CODE", help="Origin airport IATA (default: OSL)")
     p.add_argument("--destination", "-d", type=str, default=None, metavar="CODE", help="Destination airport IATA (default: BKK)")
     p.add_argument("--depart", type=str, default=None, metavar="YYYY-MM-DD", help="Departure date (default: 2026-08-17)")
@@ -906,34 +1176,42 @@ def parse_args(argv=None):
 # ============================================================
 
 
-def scan_outbound(headers, cookies, args, max_price, weight, max_dur, top_n, raw=False):
-    base = datetime.strptime(SEARCH["departure_date"], "%Y-%m-%d").date()
-    ret = datetime.strptime(SEARCH["return_date"], "%Y-%m-%d").date()
-    before = args.ob if args.ob is not None else SCAN["days_before_outbound"]
-    after = args.ob if args.ob is not None else SCAN["days_after_outbound"]
+def _scan_dates(headers, cookies, args, max_price, weight, max_dur, top_n, raw, direction):
+    if direction == "OB":
+        base = datetime.strptime(SEARCH["departure_date"], "%Y-%m-%d").date()
+        fixed = datetime.strptime(SEARCH["return_date"], "%Y-%m-%d").date()
+        before_key, after_key = "days_before_outbound", "days_after_outbound"
+        arg_val, label = args.ob, "Outbound"
+        origin, dest = SEARCH["origin"], SEARCH["destination"]
+    else:
+        base = datetime.strptime(SEARCH["return_date"], "%Y-%m-%d").date()
+        fixed = datetime.strptime(SEARCH["departure_date"], "%Y-%m-%d").date()
+        before_key, after_key = "days_before_return", "days_after_return"
+        arg_val, label = args.rb, "Return"
+        origin, dest = SEARCH["destination"], SEARCH["origin"]
+
+    before = arg_val if arg_val is not None else SCAN[before_key]
+    after = arg_val if arg_val is not None else SCAN[after_key]
     min_trip = args.min_trip if args.min_trip is not None else SCAN["min_trip_days"]
 
     all_results = []
     dates_to_check = [base + timedelta(days=i) for i in range(-before, after + 1)]
-
-    if _filter_bad:
-        dates_to_check = [d for d in dates_to_check if not
-            is_bad_day(f"{SEARCH['origin']}_{SEARCH['destination']}", d.isoformat())
-        ]
-
     total = len(dates_to_check)
 
     for idx, d in enumerate(dates_to_check):
-        if (ret - d).days < min_trip:
-            log.print(f"[dim]Skipping {d}: trip={(ret-d).days}d < min {min_trip}d[/dim]")
+        trip = (fixed - d).days if direction == "OB" else (d - fixed).days
+        if trip < min_trip:
+            log.print(f"[dim]Skipping {d}: trip={trip}d < min {min_trip}d[/dim]")
             continue
-        ob_str = d.isoformat()
-        log.print(f"[cyan]Outbound request {idx+1}/{total}: {d}[/cyan]")
-        results = _fetch_and_parse(headers, cookies, SEARCH["origin"], SEARCH["destination"], ob_str, ob_str, ret.isoformat(), "OB", max_dur)
+        date_str = d.isoformat()
+        log.print(f"[cyan]{label} request {idx+1}/{total}: {d}[/cyan]")
+        dep_date = date_str if direction == "OB" else fixed.isoformat()
+        ret_date = fixed.isoformat() if direction == "OB" else date_str
+        results = _fetch_and_parse(headers, cookies, origin, dest, date_str, dep_date, ret_date, direction, max_dur)
         all_results.extend(results)
         if idx < total - 1:
             next_d = dates_to_check[idx + 1].isoformat()
-            if not _is_cache_hit(SEARCH["origin"], SEARCH["destination"], next_d):
+            if not _is_cache_hit(origin, dest, next_d):
                 delay = args.delay if args.delay is not None else SCAN["delay_seconds"]
                 log.print(f"  [dim]Waiting {delay}s...[/dim]")
                 time.sleep(delay)
@@ -949,51 +1227,14 @@ def scan_outbound(headers, cookies, args, max_price, weight, max_dur, top_n, raw
         return []
     scored = score_results(filtered, weight)
     return scored[:top_n]
+
+
+def scan_outbound(headers, cookies, args, max_price, weight, max_dur, top_n, raw=False):
+    return _scan_dates(headers, cookies, args, max_price, weight, max_dur, top_n, raw, "OB")
 
 
 def scan_return(headers, cookies, args, max_price, weight, max_dur, top_n, raw=False):
-    dep = datetime.strptime(SEARCH["departure_date"], "%Y-%m-%d").date()
-    base = datetime.strptime(SEARCH["return_date"], "%Y-%m-%d").date()
-    before = args.rb if args.rb is not None else SCAN["days_before_return"]
-    after = args.rb if args.rb is not None else SCAN["days_after_return"]
-    min_trip = args.min_trip if args.min_trip is not None else SCAN["min_trip_days"]
-
-    all_results = []
-    dates_to_check = [base + timedelta(days=i) for i in range(-before, after + 1)]
-
-    if _filter_bad:
-        dates_to_check = [d for d in dates_to_check if not
-            is_bad_day(f"{SEARCH['destination']}_{SEARCH['origin']}", d.isoformat())
-        ]
-
-    total = len(dates_to_check)
-
-    for idx, d in enumerate(dates_to_check):
-        if (d - dep).days < min_trip:
-            log.print(f"[dim]Skipping {d}: trip={(d-dep).days}d < min {min_trip}d[/dim]")
-            continue
-        rb_str = d.isoformat()
-        log.print(f"[cyan]Return request {idx+1}/{total}: {d}[/cyan]")
-        results = _fetch_and_parse(headers, cookies, SEARCH["destination"], SEARCH["origin"], rb_str, dep.isoformat(), rb_str, "RB", max_dur)
-        all_results.extend(results)
-        if idx < total - 1:
-            next_d = dates_to_check[idx + 1].isoformat()
-            if not _is_cache_hit(SEARCH["destination"], SEARCH["origin"], next_d):
-                delay = args.delay if args.delay is not None else SCAN["delay_seconds"]
-                log.print(f"  [dim]Waiting {delay}s...[/dim]")
-                time.sleep(delay)
-
-    update_price_map(all_results)
-    all_results = filter_dirt_cheap(all_results)
-
-    if raw:
-        return all_results
-    filtered = filter_results(all_results, max_price, max_dur)
-    if not filtered:
-        log.print("[yellow]No results passed filters (max price/duration).[/yellow]")
-        return []
-    scored = score_results(filtered, weight)
-    return scored[:top_n]
+    return _scan_dates(headers, cookies, args, max_price, weight, max_dur, top_n, raw, "RB")
 
 
 # ============================================================
@@ -1010,14 +1251,6 @@ def drift_scan(headers, cookies, args, max_price, max_dur):
 
     all_results = []
     offsets = list(range(-drift, drift + 1))
-
-    if _filter_bad:
-        offsets = [o for o in offsets if not (
-            is_bad_day(f"{SEARCH['origin']}_{SEARCH['destination']}", (base_ob + timedelta(days=o)).isoformat())
-            or is_bad_day(f"{SEARCH['destination']}_{SEARCH['origin']}", (base_rb + timedelta(days=o)).isoformat())
-        )]
-        if len(offsets) < drift * 2 + 1:
-            log.print(f"[dim]Filtered to {len(offsets)}/{drift*2+1} date pairs (bad days removed)[/dim]")
 
     total = len(offsets)
 
@@ -1068,13 +1301,6 @@ def drift_scan_return(headers, cookies, args, max_price, max_dur):
 
     all_results = []
     offsets = list(range(-drift, drift + 1))
-
-    if _filter_bad:
-        offsets = [o for o in offsets if not
-            is_bad_day(f"{SEARCH['destination']}_{SEARCH['origin']}", (base_rb + timedelta(days=o)).isoformat())
-        ]
-        if len(offsets) < drift * 2 + 1:
-            log.print(f"[dim]Filtered to {len(offsets)}/{drift*2+1} return dates (bad days removed)[/dim]")
 
     total = len(offsets)
 
@@ -1194,36 +1420,6 @@ def print_drift_pair_table(results, title=None, filter_note=None):
     console.print(FARE_LEGEND, style="white")
     if filter_note:
         console.print(filter_note, style="dim white")
-
-
-# ============================================================
-# BAD-PATTERN FILTER (skip known-bad days before API calls)
-# ============================================================
-
-
-def load_bad_patterns():
-    if not os.path.exists(BAD_PATTERNS_FILE):
-        return {}
-    with open(BAD_PATTERNS_FILE) as f:
-        return json.load(f)
-
-
-def save_bad_patterns(patterns):
-    with open(BAD_PATTERNS_FILE, "w") as f:
-        json.dump(patterns, f, indent=2)
-
-
-def is_bad_day(direction, date_str):
-    day = datetime.strptime(date_str, "%Y-%m-%d").strftime("%a")
-    patterns = load_bad_patterns()
-    return day in patterns.get(direction, {})
-
-
-def flag_bad_day(direction, day, reason):
-    patterns = load_bad_patterns()
-    patterns.setdefault(direction, {})[day] = reason
-    save_bad_patterns(patterns)
-    log.print(f"[yellow]Flagged {direction} {day}: {reason}[/yellow]")
 
 
 # ============================================================
@@ -1392,15 +1588,6 @@ def print_booking_links(results):
 def main():
     args = parse_args()
 
-    # -- flag-bad: early-return curation command
-    if args.flag_bad:
-        flag_bad_day(args.flag_bad[0], args.flag_bad[1], args.flag_bad[2])
-        return
-
-    # -- filter-bad: activate bad-day pre-filter
-    if args.filter_bad:
-        set_filter_bad(True)
-
     # -- paste mode
     if args.paste:
         cfg = prompt_paste_headers()
@@ -1420,6 +1607,30 @@ def main():
     cookies = cfg.get("cookies", {})
 
     set_nocache(args.nocache)
+
+    # Cache archival (auto on every run)
+    archived = archive_stale_cache()
+    if archived:
+        log.print(f"[dim]Archived {archived} stale entries, archive trimmed to {ARCHIVE_MAX_DAYS}d[/dim]")
+
+    # --prune-cache: manual archive trigger
+    if args.prune_cache:
+        log.print(f"[green]Pruned: {archived} entries archived, archive \u2264 {ARCHIVE_MAX_DAYS}d[/green]")
+        return
+
+    # --calendar / --trends: analytics mode (can combine both)
+    if args.calendar or args.trends:
+        archive_prices = _load_archive_prices()
+        if args.calendar:
+            try:
+                cal_year, cal_month = _parse_calendar_arg(args.calendar)
+            except ValueError as e:
+                log.print(f"[red]{e}[/red]")
+                sys.exit(1)
+            print_price_calendar(cal_year, cal_month, SEARCH["origin"], SEARCH["destination"], archive_prices=archive_prices)
+        if args.trends:
+            print_price_trends(SEARCH["origin"], SEARCH["destination"], archive_prices=archive_prices)
+        return
 
     # CLI overrides for search params
     if args.origin:
