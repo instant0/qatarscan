@@ -1,0 +1,48 @@
+# Qatar Airways Flight Scanner
+
+Scrapes the Qatar Airways BFF API to find the cheapest flights between two
+cities, with support for drift scans (varying dates), mixed-cabin
+recommendations (economy one way, business the other), and a price map to
+visualize day-of-week trends.
+
+## Quick start
+
+1. Install dependencies: `pip install requests rich`
+2. Paste browser headers: `python flights.py --paste`
+   (Open Chrome devtools on qatarairways.com, copy the `request.headers` from
+   any flight search API call.)
+3. Search a single pair: `python flights.py`
+4. Scan ±N days around both dates: `python flights.py --drift 5`
+5. See mixed-cabin recommendations: `python flights.py --drift 5 --recommend`
+
+## Usage
+
+```
+python flights.py [flags]
+
+Flags:
+  -o, --origin CODE         Origin airport (default: OSL)
+  -d, --destination CODE    Destination airport (default: BKK)
+  --depart YYYY-MM-DD       Outbound date (default: 2026-08-17)
+  --ret YYYY-MM-DD          Return date (default: 2026-09-04)
+  --cabin CABIN             Cabin class: ECONOMY, BUSINESS (default: ECONOMY)
+  --drift N                 Shift both dates ±N days, preserve trip length
+  --drift-ret N             Shift return date ±N days, keep outbound fixed
+  --scan                    Scan a range of outbound dates
+  --ob N                    Scan N outbound dates
+  --rb N                    Scan N return dates
+  --top N                   Top N results per scan (default: 5)
+  --max-duration HOURS      Max flight duration (default: 24)
+  --max-price CABIN=VAL     Price cap, e.g. ECONOMY=8000,BUSINESS=14000
+  --nofilter                Disable price filter
+  --all-fares               Include BUSINESS_LITE / BUSINESS_ELITE fares
+  --recommend [N]           Show top N mixed-cabin combos after drift
+  --filter-bad              Skip API calls for known-bad day+route combos
+  --flag-bad DIR DAY REASON Manually flag a bad pattern
+  --price-map               Show day-of-week price trends
+  --paste                   Paste new browser headers
+  --nocache                 Bypass offers cache
+  --json                    Output raw JSON
+  --delay SEC               Delay between API calls
+  --help                    Show this help
+```
