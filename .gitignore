@@ -5,3 +5,4 @@ price_map.json
 *.results.json
 raw_response.json
 __pycache__/
+cache_archive.json
