@@ -6,3 +6,17 @@ price_map.json
 raw_response.json
 __pycache__/
 cache_archive.json
+
+# Agentic helper files
+.opencode/node_modules/
+.opencode/package.json
+.opencode/package-lock.json
+.cursor/
+.aider*
+.claude/
+cline/
+.github/copilot-instructions.md
+agent.md
+[Aa]gents*
+AGENTS.md
+.opencode/

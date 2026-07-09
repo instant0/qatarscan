@@ -61,14 +61,6 @@ Search for flights from a specific origin to a destination on given dates:
 python flights.py --origin OSL --destination BKK --depart 2026-08-17 --ret 2026-09-04
 ```
 
-### Basic Flight Search
-
-Search for flights from a specific origin to a destination on given dates:
-
-```
-python flights.py --origin OSL --destination BKK --depart 2026-08-17 --ret 2026-09-04
-```
-
 Sample Result:
 
 ```
