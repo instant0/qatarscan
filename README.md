@@ -5,6 +5,12 @@ cities, with support for drift scans (varying dates), mixed-cabin
 recommendations (economy one way, business the other), price calendar,
 trend analysis, and historical cache archiving.
 
+This project is an independent tool that automates requests made by an
+authenticated user. Users must supply their own valid browser session and
+are responsible for complying with the Terms of Service of the data
+provider. This project does not include credentials, cookies, or access to
+any proprietary data.
+
 ## Quick start
 
 1. Install dependencies: `pip install requests rich`
