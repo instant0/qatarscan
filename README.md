@@ -46,9 +46,10 @@ Flags:
   --json                    Output raw JSON
   --delay SEC               Delay between API calls
   --help                    Show this help
+```
 
 Notes:
-  --calendar and --trends can be combined: python flights.py --trends --calendar
+  `--calendar` and `--trends` can be combined: `python flights.py --trends --calendar`
 
 ## Examples
 
