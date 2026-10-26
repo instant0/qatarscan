@@ -1711,48 +1711,42 @@ class RateLimiter:
         while True:
             if self.budget is not None and self.calls_this_run >= self.budget:
                 raise BudgetExceeded(self.budget)
-            try:
-                with self._lock():
-                    try:
-                        state = self._read_state()
-                    except RateStateError:
-                        fallback_seconds = max(1, int(SCAN.get("block_minutes", 20)) * 60)
-                        synthetic_until = (
-                            self.clock() + timedelta(seconds=fallback_seconds)
-                        ).isoformat()
-                        log.print(
-                            "[yellow]Rate-limit state is corrupt or unreadable. "
-                            "Run `--clear-block` to reset it.[/yellow]"
-                        )
-                        raise RateLimited(
-                            fallback_seconds,
-                            synthetic_until,
-                            state_error=True,
-                        )
-                    blocked = self._parse_timestamp(state.get("blocked_until"))
-                    now = self.clock()
-                    if blocked is not None and blocked > now:
-                        if self.force:
-                            pass
-                        else:
-                            remaining = math.ceil((blocked - now).total_seconds())
-                            raise RateLimited(remaining, blocked.isoformat(), state_error=False)
-                    last_call = None
-                    for value in state.get("live_calls", []):
-                        parsed = self._parse_timestamp(value)
-                        if parsed is not None and (last_call is None or parsed > last_call):
-                            last_call = parsed
-                    delay = 0.0
-                    if last_call is not None:
-                        target = last_call + timedelta(seconds=self._required_interval())
-                        if now < target:
-                            delay = (target - now).total_seconds()
-            except RateLimited:
-                raise
-            except BudgetExceeded:
-                raise
-            except Exception as e:
-                raise
+            with self._lock():
+                try:
+                    state = self._read_state()
+                except RateStateError:
+                    fallback_seconds = max(1, int(SCAN.get("block_minutes", 20)) * 60)
+                    synthetic_until = (
+                        self.clock() + timedelta(seconds=fallback_seconds)
+                    ).isoformat()
+                    log.print(
+                        "[yellow]Rate-limit state is corrupt or unreadable. "
+                        "Run `--clear-block` to reset it.[/yellow]"
+                    )
+                    raise RateLimited(
+                        fallback_seconds,
+                        synthetic_until,
+                        state_error=True,
+                    )
+                blocked = self._parse_timestamp(state.get("blocked_until"))
+                now = self.clock()
+                if blocked is not None and blocked > now and not self.force:
+                    remaining = math.ceil((blocked - now).total_seconds())
+                    raise RateLimited(remaining, blocked.isoformat())
+                last_call = None
+                for value in state.get("live_calls", []):
+                    parsed = self._parse_timestamp(value)
+                    if parsed is not None and (
+                        last_call is None or parsed > last_call
+                    ):
+                        last_call = parsed
+                delay = 0.0
+                if last_call is not None:
+                    target = last_call + timedelta(
+                        seconds=self._required_interval()
+                    )
+                    if now < target:
+                        delay = (target - now).total_seconds()
             if delay > 0:
                 log.print(f"[dim]Rate-limit pause {delay:.0f}s[/dim]")
                 self.sleep(delay)

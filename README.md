@@ -76,11 +76,12 @@ Flags:
   --budget N                Max live POST calls per run (0 = no limit). Failed/timed-out calls count; cache hits do not.
   --force                   Ignore an active rate-limit cooldown for this run
   --clear-block             Clear the persisted rate-limit cooldown and exit
-  Corrupt/unreadable rate-limit state fails closed. `--force` does not bypass unusable state; use `--clear-block` to reset it.
   --help                    Show this help
 ```
 
 Notes:
+  Corrupt/unreadable rate-limit state fails closed. `--force` does not bypass unusable
+  state; use `--clear-block` to reset it.
   `--calendar` and `--trends` can be combined: `python flights.py --trends --calendar`
 
 ## Examples

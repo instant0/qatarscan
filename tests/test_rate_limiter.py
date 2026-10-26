@@ -5,6 +5,7 @@ import threading
 import time
 import unittest
 from datetime import datetime, timedelta, timezone
+from unittest.mock import MagicMock, patch
 
 import flights
 
@@ -234,10 +235,6 @@ class RateLimiterTests(unittest.TestCase):
         self.assertEqual(len(state["live_calls"]), 20)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class RateLimiterHardeningTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -306,6 +303,36 @@ class RateLimiterHardeningTests(unittest.TestCase):
         self.limiter.record_call()
         self.assertEqual(calls, [35.0, 10.0])
 
+    def test_force_ignores_block_during_sleep(self):
+        limiter = flights.RateLimiter(
+            state_file=self.state_file,
+            lock_file=self.lock_file,
+            base_delay=45,
+            budget=None,
+            force=True,
+            clock=self.clock,
+            sleep=self.sleep,
+            rng=SequenceRng([45]),
+        )
+        limiter.wait()
+        limiter.record_call()
+        calls = []
+        self.clock.advance(10)
+
+        def sleep_and_block(seconds):
+            calls.append(seconds)
+            blocked_until = self.clock() + timedelta(minutes=20)
+            with open(self.state_file, "w") as f:
+                json.dump(
+                    {"live_calls": [], "blocked_until": blocked_until.isoformat()},
+                    f,
+                )
+            self.clock.advance(seconds)
+
+        limiter.sleep = sleep_and_block
+        limiter.wait()
+        self.assertEqual(calls, [35.0])
+
     def test_corrupt_cases_fail_closed(self):
         for bad in ["{bad json", json.dumps([]), json.dumps("x")]:
             state_file = os.path.join(self.tmp.name, f"s{hash(bad)}.json")
@@ -333,6 +360,12 @@ class RateLimiterHardeningTests(unittest.TestCase):
             self.limiter.wait()
         self.assertTrue(getattr(ctx.exception, "state_error", False))
 
+    def test_unreadable_state_raises_rate_state_error(self):
+        with patch("builtins.open", side_effect=PermissionError("denied")):
+            with self.assertRaises(flights.RateStateError) as ctx:
+                self.limiter._read_state()
+        self.assertIn("--clear-block", str(ctx.exception))
+
     def test_force_does_not_bypass_corrupt_state(self):
         with open(self.state_file, "w") as f:
             f.write("{bad")
@@ -358,17 +391,31 @@ class RateLimiterHardeningTests(unittest.TestCase):
     def test_record_call_on_corrupt_state_warns_and_does_not_raise(self):
         with open(self.state_file, "w") as f:
             f.write("{bad")
-        self.limiter.record_call()
+        with patch.object(flights.log, "print") as log_print:
+            self.limiter.record_call()
         self.assertEqual(self.limiter.calls_this_run, 1)
+        output = " ".join(
+            str(arg) for call in log_print.call_args_list for arg in call.args
+        )
+        self.assertIn("corrupt", output)
 
     def test_clear_block_recovers_corrupt_and_preserves_live_calls_when_valid(self):
+        live = self.clock().isoformat()
         with open(self.state_file, "w") as f:
-            json.dump({"live_calls": [self.clock().isoformat()], "blocked_until": (self.clock()+timedelta(minutes=10)).isoformat()}, f)
+            json.dump(
+                {
+                    "live_calls": [live],
+                    "blocked_until": (
+                        self.clock() + timedelta(minutes=10)
+                    ).isoformat(),
+                },
+                f,
+            )
         self.limiter.clear_block()
         with open(self.state_file) as f:
             state = json.load(f)
         self.assertIsNone(state["blocked_until"])
-        self.assertTrue(len(state["live_calls"]) >= 0)
+        self.assertEqual(state["live_calls"], [live])
 
         with open(self.state_file, "w") as f:
             f.write("{bad")
@@ -379,23 +426,11 @@ class RateLimiterHardeningTests(unittest.TestCase):
         self.assertEqual(state["live_calls"], [])
 
     def test_clear_block_write_failure_raises_local_state_error(self):
-        limiter = flights.RateLimiter(
-            state_file=os.path.join(self.tmp.name, "subdir", "state.json"),
-            lock_file=self.lock_file,
-            base_delay=45,
-            clock=self.clock,
-            sleep=self.sleep,
-            rng=self.rng,
-        )
-        os.makedirs(os.path.join(self.tmp.name, "subdir"), exist_ok=True)
-        with open(os.path.join(self.tmp.name, "subdir", "state.json"), "w") as f:
-            f.write("{bad")
-        os.chmod(os.path.join(self.tmp.name, "subdir"), 0o555)
-        try:
+        with patch.object(
+            self.limiter, "_write_state", side_effect=OSError("disk full")
+        ):
             with self.assertRaises(flights.LocalStateError):
-                limiter.clear_block()
-        finally:
-            os.chmod(os.path.join(self.tmp.name, "subdir"), 0o755)
+                self.limiter.clear_block()
 
     def test_record_block_preserves_longer_and_extends_shorter(self):
         self.limiter.record_block(minutes=5)
@@ -414,23 +449,46 @@ class RateLimiterHardeningTests(unittest.TestCase):
         b3 = datetime.fromisoformat(s3["blocked_until"])
         self.assertGreaterEqual(b3, b2)
 
-    def test_record_block_read_write_failure_does_not_raise(self):
-        limiter = flights.RateLimiter(
-            state_file=os.path.join(self.tmp.name, "x", "state.json"),
-            lock_file=self.lock_file,
-            base_delay=45,
-            clock=self.clock,
-            sleep=self.sleep,
-            rng=self.rng,
-        )
-        os.makedirs(os.path.join(self.tmp.name, "x"), exist_ok=True)
-        with open(os.path.join(self.tmp.name, "x", "state.json"), "w") as f:
+    def test_record_block_read_failure_does_not_raise(self):
+        with open(self.state_file, "w") as f:
             f.write("{bad")
-        os.chmod(os.path.join(self.tmp.name, "x"), 0o555)
-        try:
-            limiter.record_block(minutes=20)  # should not raise
-        finally:
-            os.chmod(os.path.join(self.tmp.name, "x"), 0o755)
+        with patch.object(flights.log, "print") as log_print:
+            self.limiter.record_block(minutes=20)
+        output = " ".join(
+            str(arg) for call in log_print.call_args_list for arg in call.args
+        )
+        self.assertIn("Could not record", output)
+
+    def test_record_block_write_failure_does_not_raise(self):
+        with patch.object(
+            self.limiter, "_write_state", side_effect=OSError("disk full")
+        ):
+            with patch.object(flights.log, "print") as log_print:
+                self.limiter.record_block(minutes=20)
+        output = " ".join(
+            str(arg) for call in log_print.call_args_list for arg in call.args
+        )
+        self.assertIn("disk full", output)
+
+    def test_main_clear_block_failure_exits_without_success(self):
+        args = flights.parse_args([])
+        args.clear_block = True
+        limiter = MagicMock()
+        limiter.clear_block.side_effect = flights.LocalStateError("cannot write")
+        with patch.object(flights, "parse_args", return_value=args):
+            with patch.object(
+                flights, "configure_rate_limiter", return_value=limiter
+            ):
+                with patch.object(flights, "get_rate_limiter", return_value=limiter):
+                    with patch.object(flights.log, "print") as log_print:
+                        with self.assertRaises(SystemExit) as ctx:
+                            flights.main()
+        self.assertEqual(ctx.exception.code, 1)
+        output = " ".join(
+            str(arg) for call in log_print.call_args_list for arg in call.args
+        )
+        self.assertIn("cannot write", output)
+        self.assertNotIn("cleared", output.lower())
 
     def test_missing_and_empty_behave_as_first_run(self):
         missing = flights.RateLimiter(
@@ -443,6 +501,8 @@ class RateLimiterHardeningTests(unittest.TestCase):
         )
         missing.wait()
         missing.record_call()
+        with open(os.path.join(self.tmp.name, "missing2.json")) as f:
+            self.assertEqual(len(json.load(f)["live_calls"]), 1)
 
         empty = flights.RateLimiter(
             state_file=os.path.join(self.tmp.name, "empty.json"),
@@ -456,3 +516,9 @@ class RateLimiterHardeningTests(unittest.TestCase):
             f.write("   ")
         empty.wait()
         empty.record_call()
+        with open(os.path.join(self.tmp.name, "empty.json")) as f:
+            self.assertEqual(len(json.load(f)["live_calls"]), 1)
+
+
+if __name__ == "__main__":
+    unittest.main()

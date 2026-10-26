@@ -1,7 +1,7 @@
 # T11 — Rate limiter and cooldown hardening
 
 - **Required**: Yes
-- **Status**: **Done**
+- **Status**: **Done** (2026-10-26)
 - **Depends on**: T04, T05
 - **Blocks**: T06, T14
 - **Reference**: `../task-data.md` §6 (pacing), §7 (state), §8 (errors), §11 (tests);
@@ -159,4 +159,18 @@ decisions remain in force unless explicitly superseded here.
 
 ## Execution log
 
-- Implemented in flights.py (RateLimiter hardening), added/updated tests, updated README, marked complete 2026-10-26.
+- Added `RateStateError(LocalStateError)` and made `_read_state()` fail closed on unreadable
+  files, invalid/non-object JSON, and malformed `blocked_until`; missing/empty state remains a
+  normal first run.
+- Reworked `wait()` into a lock/release/sleep/recheck loop: budget first, fresh cooldown check
+  after every wake, recompute spacing after concurrent calls, force only bypasses valid
+  cooldowns. Limiter-state failure now logs and raises `RateLimited(state_error=True)` with the
+  `SCAN["block_minutes"]` fallback and no sleep.
+- `is_blocked()`/`blocked_remaining()` return the fail-closed fallback instead of raising;
+  `_abort_message()` gives a `--clear-block` recovery message for state errors.
+- `record_block()` preserves the later cooldown and never raises on read/write failure;
+  `record_call()` warns/skips on corrupt state; `clear_block()` recovers corrupt state,
+  preserves valid `live_calls`, and raises `LocalStateError` on write failure.
+- Added/updated `tests/test_rate_limiter.py` and the state-error abort-message test.
+- Updated README and status docs. Verification: `py_compile` OK; full suite 115 tests OK;
+  `--help` exits 0; import OK. No live scans or network calls.

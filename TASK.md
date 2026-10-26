@@ -27,6 +27,10 @@ Deferred research: `TASK_FARE_CALENDAR.md`
 - 2026-10-26 — T09 response parsing and FX hardening shipped: non-JSON/malformed 200s are
   typed transient failures, parsing skips bad offers/fares/segments, and FX/cache entries are
   validated before use. Full suite passes (98 tests).
+- 2026-10-26 — T11 rate-limiter hardening shipped: cooldowns are rechecked after sleeps,
+  corrupt/unreadable state fails closed (even with `--force`), abort-path block writes no
+  longer mask the original error, and `--clear-block` recovers unusable state. Full suite
+  passes (115 tests).
 
 ---
 
