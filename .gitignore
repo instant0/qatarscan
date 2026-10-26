@@ -6,6 +6,10 @@ price_map.json
 raw_response.json
 __pycache__/
 cache_archive.json
+.rate_state.json
+.rate_state.lock
+.data_state.lock
+*.corrupt-*
 
 # Agentic helper files
 .opencode/node_modules/

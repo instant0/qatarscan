@@ -15,11 +15,32 @@ any proprietary data.
 
 1. Install dependencies: `pip install requests rich`
 2. Paste browser headers: `python flights.py --paste`
-   (Open Chrome devtools on qatarairways.com, copy the `request.headers` from
-   any flight search API call.)
+   (See [Obtaining request headers](#obtaining-request-headers) below.)
 3. Search a single pair: `python flights.py`
 4. Scan ±N days around both dates: `python flights.py --drift 5`
 5. See mixed-cabin recommendations: `python flights.py --drift 5 --recommend`
+
+## Obtaining request headers
+
+Request headers **must** be captured from an **un-authenticated** page on the
+Qatar Airways website flight scans — do not sign in to your Qatar Airways
+account first.
+
+Steps:
+
+1. Open a suitable un-authenticated flight-scans page (example below).
+2. Open Chrome devtools → **Network** tab.
+3. Set the filter to **XHR**.
+4. Run a flight search, then search the requests for `flight-offers`.
+5. Select the `flight-offers` request and copy its request headers (in
+   devtools this is available as the `request.headers` object, e.g. via
+   "Copy → Copy as fetch" or the Headers panel).
+
+An example of a suitable un-authenticated flight-scans page:
+
+```
+https://www.qatarairways.com/app/booking/flight-selection?widget=QR&searchType=F&addTaxToFare=Y&minPurTime=0&selLang=en&tripType=R&fromStation=OSL&toStation=BKK&departing=2026-12-27&returning=2027-01-07&bookingClass=E&adults=1&children=0&infants=0&ofw=0&teenager=0&flexibleDate=off&allowRedemption=N
+```
 
 ## Usage
 
@@ -50,7 +71,11 @@ Flags:
   --urls                    Show booking links
   --nocache                 Bypass offers cache
   --json                    Output raw JSON
-  --delay SEC               Delay between API calls
+  --delay SEC               Base spacing between live calls in seconds (default 45, jittered -5/+10)
+  --max-retries {0,1}       Retry transient 5xx/timeout failures once (default 0; edge/auth/rate/budget are never retried)
+  --budget N                Maximum live POST attempts per run (default: unlimited)
+  --force                   Ignore an active rate-limit cooldown for this run
+  --clear-block             Clear the persisted rate-limit cooldown and exit
   --help                    Show this help
 ```
 

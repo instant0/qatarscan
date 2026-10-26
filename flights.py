@@ -1,14 +1,24 @@
+import fcntl
 import json
+import math
 import os
+import random
+import re
+import secrets
+import shutil
 import sys
+import tempfile
 import time
 import argparse
 from argparse import ArgumentParser
-from datetime import datetime, timedelta
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
+from urllib.parse import urlencode
 
 import requests
 from rich.box import SIMPLE_HEAVY
 from rich.console import Console
+from rich.markup import escape
 from rich.table import Table
 
 # ============================================================
@@ -76,12 +86,14 @@ SCAN = {
     "days_after_outbound": 4,
     "days_before_return": 0,
     "days_after_return": 0,
-    "delay_seconds": 20,
+    "delay_seconds": 45,
     "max_duration_hours": 25,
     "max_price": {"ECONOMY": 9000, "BUSINESS": 21000},
     "weight": "price",
     "top_n": 5,
     "min_trip_days": 8,
+    "block_minutes": 20,
+    "max_retries": 0,
 }
 
 # ============================================================
@@ -94,6 +106,9 @@ CURRENCY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "curren
 OFFERS_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "offers_cache.json")
 PRICE_MAP_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "price_map.json")
 CACHE_ARCHIVE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache_archive.json")
+RATE_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".rate_state.json")
+RATE_LOCK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".rate_state.lock")
+DATA_LOCK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".data_state.lock")
 ARCHIVE_MAX_DAYS = 365
 LAYOUT_RANK = {"QSuite": 4, "Door": 3, "Pod": 2, "Old": 1, "Unknown": 0}
 
@@ -121,6 +136,75 @@ def classify_layout(aircraft_code, flight_number, qsuite):
 
 console = Console()
 log = Console(stderr=True)
+
+
+class LocalStateError(Exception):
+    pass
+
+
+def _atomic_write_json(path, data):
+    directory = os.path.dirname(os.path.abspath(path))
+    fd, tmp_path = tempfile.mkstemp(prefix=".tmp-", suffix=".json", dir=directory)
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+@contextmanager
+def _locked_data():
+    with open(DATA_LOCK_FILE, "a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def _quarantine_corrupt(path):
+    if not os.path.exists(path):
+        return None
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    dest = f"{path}.corrupt-{stamp}"
+    try:
+        shutil.copy2(path, dest)
+    except OSError as e:
+        raise LocalStateError(
+            f"Cannot quarantine corrupt {os.path.basename(path)}: {e}"
+        ) from e
+    return dest
+
+
+def _read_json_file(path, default, label, expected_type=dict, quarantine=True):
+    if not os.path.exists(path):
+        return default
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        if not isinstance(data, expected_type):
+            raise ValueError(f"expected {expected_type.__name__}")
+        return data
+    except (json.JSONDecodeError, OSError, ValueError) as e:
+        if quarantine:
+            dest = _quarantine_corrupt(path)
+            log.print(
+                f"[yellow]{escape(label)} is corrupt ({escape(str(e))}); "
+                f"quarantined to {escape(dest or path)}[/yellow]"
+            )
+        else:
+            log.print(
+                f"[yellow]{escape(label)} is invalid ({escape(str(e))}); ignoring.[/yellow]"
+            )
+        return default
+
 
 # ============================================================
 # CONFIG PERSISTENCE
@@ -155,40 +239,129 @@ def save_config(config):
 # ============================================================
 
 
+class PasteError(ValueError):
+    pass
+
+
+REQUIRED_HEADERS = ("session-id", "X-AssignedDeviceID", "nbx_fs_api_key", "User-Agent")
+
+CANONICAL_HEADERS = {
+    "session-id": "session-id",
+    "x-assigneddeviceid": "X-AssignedDeviceID",
+    "nbx_fs_api_key": "nbx_fs_api_key",
+    "user-agent": "User-Agent",
+    "accept": "Accept",
+    "accept-language": "Accept-Language",
+    "sec-gpc": "Sec-GPC",
+    "sec-fetch-dest": "Sec-Fetch-Dest",
+    "sec-fetch-mode": "Sec-Fetch-Mode",
+    "sec-fetch-site": "Sec-Fetch-Site",
+    "pragma": "Pragma",
+    "cache-control": "Cache-Control",
+    "origin": "Origin",
+    "referer": "Referer",
+    "qr-lang": "qr-lang",
+    "content-type": "Content-Type",
+    "request-id": "Request-Id",
+    "traceparent": "traceparent",
+}
+
+COOKIE_ALLOWLIST = {"_abck", "bm_sz", "bm_sv", "ak_bmsc", "AKA_A2"}
+COOKIE_ALLOWLIST_PREFIXES = ("BIGipServer", "TS0")
+
+
+def _cookie_allowed(name):
+    return name in COOKIE_ALLOWLIST or name.startswith(COOKIE_ALLOWLIST_PREFIXES)
+
+
+def _abck_state(cookies):
+    value = cookies.get("_abck", "")
+    if "~0~" in value:
+        return "valid"
+    if "~-1~" in value:
+        return "invalid"
+    return "unknown"
+
+
 def parse_pasted_headers(text):
     headers = {}
     cookies = {}
+    method = None
+    path = None
+    host = None
+    saw_request_line = False
+
     for line in text.strip().splitlines():
         line = line.strip()
+        if not line:
+            continue
+
+        parts = line.split()
+        if parts and parts[0].upper() in ("POST", "GET", "PUT", "PATCH", "DELETE"):
+            if len(parts) >= 2:
+                method = parts[0].upper()
+                path = parts[1]
+                saw_request_line = True
+            continue
+
         if ": " not in line:
             continue
         key, value = line.split(": ", 1)
         key = key.strip()
         value = value.strip()
-        if key == "Cookie":
+        lower = key.lower()
+
+        if lower == "cookie":
             for part in value.split(";"):
                 if "=" in part:
                     ck, cv = part.split("=", 1)
-                    cookies[ck.strip()] = cv.strip()
-        elif key.lower() in (
-            "session-id",
-            "x-assigneddeviceid",
-            "nbx_fs_api_key",
-            "request-id",
-            "traceparent",
-            "qr-lang",
-        ):
-            headers[key] = value
-    headers.setdefault(
-        "User-Agent",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:152.0) Gecko/20100101 Firefox/152.0",
-    )
-    headers.setdefault("Accept", "application/json, text/plain, */*")
+                    ck = ck.strip()
+                    if _cookie_allowed(ck):
+                        cookies[ck] = cv.strip()
+            continue
+
+        if lower == "host":
+            host = value
+            continue
+
+        if lower in ("content-length", "connection", "te", "accept-encoding"):
+            continue
+
+        canonical = CANONICAL_HEADERS.get(lower)
+        if canonical:
+            headers[canonical] = value
+
+    if saw_request_line:
+        if path and path.startswith(("http://", "https://")):
+            rest = path.split("://", 1)[1]
+            host_part, _, path_part = rest.partition("/")
+            if not host:
+                host = host_part
+            path = "/" + path_part
+        if method != "POST":
+            raise PasteError(
+                f"Unexpected method {method}; paste a POST flight-offers request."
+            )
+        if path != "/dapi/public/bff/web/flight-search/flight-offers":
+            raise PasteError("Paste the flight-offers request from qatarairways.com.")
+        if host and host.lower() != "www.qatarairways.com":
+            raise PasteError(
+                f"Unexpected Host {host}; paste from www.qatarairways.com."
+            )
+        source_endpoint = "flight-offers"
+    else:
+        source_endpoint = "unknown"
+
     headers.setdefault("Content-Type", "application/json")
+    headers.setdefault("Accept", "application/json, text/plain, */*")
     headers.setdefault("Origin", "https://www.qatarairways.com")
-    headers.setdefault("Referer", "https://www.qatarairways.com/")
     headers.setdefault("qr-lang", "en")
-    return headers, cookies
+
+    missing = [h for h in REQUIRED_HEADERS if h not in headers]
+    if missing:
+        raise PasteError("Missing required headers: " + ", ".join(missing))
+
+    return headers, cookies, source_endpoint
 
 
 def prompt_paste_headers():
@@ -206,17 +379,61 @@ def prompt_paste_headers():
     if not text.strip():
         log.print("[red]No input. Exiting.[/red]")
         sys.exit(1)
-    headers, cookies = parse_pasted_headers(text)
-    if "session-id" not in headers:
-        log.print("[red]Could not find 'session-id' in pasted headers.[/red]")
+    try:
+        headers, cookies, source_endpoint = parse_pasted_headers(text)
+    except PasteError as e:
+        log.print(f"[red]{e}[/red]")
         sys.exit(1)
-    cfg = {"headers": headers, "cookies": cookies}
+    if source_endpoint == "unknown":
+        log.print(
+            "[yellow]Could not verify the source request (headers-only paste).[/yellow]"
+        )
+    missing_akamai = [c for c in ("_abck", "bm_sz", "ak_bmsc") if c not in cookies]
+    if missing_akamai:
+        log.print(
+            f"[yellow]Missing Akamai cookies: {', '.join(missing_akamai)}. "
+            f"Paste from a loaded qatarairways.com tab.[/yellow]"
+        )
+    abck = _abck_state(cookies)
+    cfg = {
+        "headers": headers,
+        "cookies": cookies,
+        "user_agent": headers.get("User-Agent"),
+        "source_endpoint": source_endpoint,
+        "last_abck_state": abck,
+    }
     save_config(cfg)
     log.print(
         f"[green]Extracted: session-id={headers.get('session-id','?')[:20]}... "
-        f"device-id={headers.get('X-AssignedDeviceID','?')[:20]}...[/green]"
+        f"device-id={headers.get('X-AssignedDeviceID','?')[:20]}... "
+        f"source={source_endpoint} abck={abck}[/green]"
     )
     return cfg
+
+
+def validate_config(cfg):
+    headers = cfg.get("headers") or {}
+    cookies = cfg.get("cookies") or {}
+    missing = [h for h in REQUIRED_HEADERS if h not in headers]
+    if missing:
+        log.print(
+            f"[red]config.json is missing required headers: {', '.join(missing)}. "
+            f"Re-run with --paste.[/red]"
+        )
+        return False
+    source = cfg.get("source_endpoint")
+    if source not in (None, "flight-offers", "unknown"):
+        log.print(
+            f"[yellow]Saved config came from {source}; "
+            f"re-paste a flight-offers request if requests fail.[/yellow]"
+        )
+    missing_akamai = [c for c in ("_abck", "bm_sz", "ak_bmsc") if c not in cookies]
+    if missing_akamai:
+        log.print(
+            f"[yellow]Missing Akamai cookies: {', '.join(missing_akamai)}; "
+            f"requests may be blocked.[/yellow]"
+        )
+    return True
 
 
 # ============================================================
@@ -264,15 +481,19 @@ _currency_rates = {}
 
 
 def load_currency_rates():
-    if not os.path.exists(CURRENCY_FILE):
-        return {}
-    with open(CURRENCY_FILE) as f:
-        return json.load(f)
+    return _read_json_file(CURRENCY_FILE, {}, "currency cache")
 
 
 def save_currency_rates(rates):
-    with open(CURRENCY_FILE, "w") as f:
-        json.dump(rates, f, indent=2)
+    try:
+        with _locked_data():
+            current = _read_json_file(CURRENCY_FILE, {}, "currency cache")
+            current.update(rates)
+            _atomic_write_json(CURRENCY_FILE, current)
+    except LocalStateError:
+        raise
+    except (OSError, TypeError, ValueError) as e:
+        log.print(f"[yellow]Could not save currency cache: {escape(str(e))}[/yellow]")
 
 
 def get_conversion_rate(target_currency):
@@ -441,72 +662,88 @@ def update_price_map(results):
     if not results:
         return
 
-    existing = {}
-    if os.path.exists(PRICE_MAP_FILE):
-        try:
-            with open(PRICE_MAP_FILE) as f:
-                existing = json.load(f)
-        except (json.JSONDecodeError, OSError):
-            existing = {}
+    try:
+        with _locked_data():
+            existing = _read_json_file(PRICE_MAP_FILE, {}, "price map")
 
-    for r in results:
-        date = r.get("departure_date")
-        fare = r.get("fare")
-        segs = r.get("segments", [])
-        if not date or not fare or not segs:
-            continue
+            for r in results:
+                if not isinstance(r, dict):
+                    continue
+                date = r.get("departure_date")
+                fare = r.get("fare")
+                segs = r.get("segments", [])
+                if not date or not fare or not isinstance(segs, list) or not segs:
+                    continue
 
-        stops = r.get("stops", 0)
-        if stops > 1:
-            continue
+                stops = r.get("stops", 0)
+                if stops > 1:
+                    continue
 
-        direction = f"{r['origin']}_{r['destination']}"
-        day = datetime.strptime(date, "%Y-%m-%d").strftime("%a")
-        price = r.get("price")
-        if price is None:
-            continue
+                origin = r.get("origin")
+                destination = r.get("destination")
+                if not origin or not destination:
+                    continue
+                try:
+                    day = datetime.strptime(date, "%Y-%m-%d").strftime("%a")
+                except (TypeError, ValueError):
+                    continue
+                price = r.get("price")
+                if price is None:
+                    continue
 
-        first = segs[0]
-        last = segs[-1]
-        flight_num = first.get("flight", "?")
-        dep_time = first.get("departure", "")[11:16] if first.get("departure") else "?"
-        arr_time = last.get("arrival", "")[11:16] if last.get("arrival") else "?"
-        transfer = compute_transfer_minutes(segs)
-        direct = stops == 1
+                first = segs[0] if isinstance(segs[0], dict) else {}
+                last = segs[-1] if isinstance(segs[-1], dict) else {}
+                flight_num = first.get("flight", "?")
+                dep_time = first.get("departure", "")[11:16] if first.get("departure") else "?"
+                arr_time = last.get("arrival", "")[11:16] if last.get("arrival") else "?"
+                transfer = compute_transfer_minutes(segs)
+                direct = stops == 1
 
-        # generate a stable key for this itinerary pattern
-        pat_key = f"{flight_num}|{dep_time}|{stops}|{transfer}"
+                pat_key = f"{flight_num}|{dep_time}|{stops}|{transfer}"
+                direction = f"{origin}_{destination}"
 
-        existing.setdefault(direction, {})
-        existing[direction].setdefault(day, {})
-        existing[direction][day].setdefault(pat_key, {
-            "flight": flight_num,
-            "departure": dep_time,
-            "arrival": arr_time,
-            "stops": stops,
-            "transfer_minutes": transfer,
-            "direct": direct,
-            "fares": {},
-        })
-        entry = existing[direction][day][pat_key]
+                if not isinstance(existing.get(direction), dict):
+                    existing[direction] = {}
+                if not isinstance(existing[direction].get(day), dict):
+                    existing[direction][day] = {}
+                if not isinstance(existing[direction][day].get(pat_key), dict):
+                    existing[direction][day][pat_key] = {
+                        "flight": flight_num,
+                        "departure": dep_time,
+                        "arrival": arr_time,
+                        "stops": stops,
+                        "transfer_minutes": transfer,
+                        "direct": direct,
+                        "fares": {},
+                    }
+                entry = existing[direction][day][pat_key]
+                if not isinstance(entry.get("fares"), dict):
+                    entry["fares"] = {}
 
-        # update arrival if we see a different one (e.g. different second leg)
-        if arr_time != entry["arrival"]:
-            entry["arrival"] = arr_time
+                if arr_time != entry.get("arrival"):
+                    entry["arrival"] = arr_time
 
-        if fare not in entry["fares"]:
-            entry["fares"][fare] = {"min": price, "max": price, "total": price, "samples": 1}
-        else:
-            fdata = entry["fares"][fare]
-            if price < fdata["min"]:
-                fdata["min"] = price
-            if price > fdata["max"]:
-                fdata["max"] = price
-            fdata["total"] += price
-            fdata["samples"] += 1
+                fdata = entry["fares"].get(fare)
+                if not isinstance(fdata, dict):
+                    entry["fares"][fare] = {
+                        "min": price,
+                        "max": price,
+                        "total": price,
+                        "samples": 1,
+                    }
+                else:
+                    if price < fdata["min"]:
+                        fdata["min"] = price
+                    if price > fdata["max"]:
+                        fdata["max"] = price
+                    fdata["total"] += price
+                    fdata["samples"] += 1
 
-    with open(PRICE_MAP_FILE, "w") as f:
-        json.dump(existing, f, indent=2)
+            _atomic_write_json(PRICE_MAP_FILE, existing)
+    except LocalStateError:
+        raise
+    except (OSError, TypeError, ValueError) as e:
+        log.print(f"[yellow]Could not update price map: {escape(str(e))}[/yellow]")
 
 
 def _fare_cell(fdata):
@@ -523,8 +760,9 @@ def print_price_map():
         console.print("[yellow]No price map data yet. Run a drift or scan first.[/yellow]")
         return
 
-    with open(PRICE_MAP_FILE) as f:
-        data = json.load(f)
+    data = _read_json_file(
+        PRICE_MAP_FILE, {}, "price map", quarantine=False
+    )
 
     if not data:
         console.print("[yellow]Price map is empty.[/yellow]")
@@ -578,17 +816,23 @@ def print_price_map():
 
 
 def _load_archive_prices():
-    if not os.path.exists(CACHE_ARCHIVE_FILE):
-        return {}
-    with open(CACHE_ARCHIVE_FILE) as f:
-        archive = json.load(f)
+    archive = _read_json_file(
+        CACHE_ARCHIVE_FILE, [], "cache archive", expected_type=list, quarantine=False
+    )
     per_date = {}
     for a in archive:
+        if not isinstance(a, dict):
+            continue
         entry = a.get("entry", {})
+        if not isinstance(entry, dict):
+            continue
         data = entry.get("data")
         if not data:
             continue
-        parts = a.get("key", "").split("_")
+        key = a.get("key")
+        if not isinstance(key, str):
+            continue
+        parts = key.split("_")
         if len(parts) < 3:
             continue
         origin, destination = parts[0], parts[1]
@@ -670,8 +914,9 @@ def print_price_calendar(year, month, origin, destination, fare_filter=None, arc
     if not os.path.exists(PRICE_MAP_FILE):
         console.print("[yellow]No price map data yet. Run a drift or scan first.[/yellow]")
         return
-    with open(PRICE_MAP_FILE) as f:
-        data = json.load(f)
+    data = _read_json_file(
+        PRICE_MAP_FILE, {}, "price map", quarantine=False
+    )
 
     direction = f"{origin}_{destination}"
     rev_direction = f"{destination}_{origin}"
@@ -730,8 +975,9 @@ def print_price_trends(origin, destination, archive_prices=None):
     if not os.path.exists(PRICE_MAP_FILE):
         console.print("[yellow]No price map data yet. Run a drift or scan first.[/yellow]")
         return
-    with open(PRICE_MAP_FILE) as f:
-        price_map = json.load(f)
+    price_map = _read_json_file(
+        PRICE_MAP_FILE, {}, "price map", quarantine=False
+    )
 
     direction = f"{origin}_{destination}"
     rev_direction = f"{destination}_{origin}"
@@ -1014,49 +1260,76 @@ def set_nocache(val):
 
 
 def load_offers_cache():
-    if not os.path.exists(OFFERS_CACHE_FILE):
-        return {}
-    with open(OFFERS_CACHE_FILE) as f:
-        return json.load(f)
+    return _read_json_file(OFFERS_CACHE_FILE, {}, "offers cache")
 
 
 def save_offers_cache(cache):
-    with open(OFFERS_CACHE_FILE, "w") as f:
-        json.dump(cache, f, indent=2)
+    try:
+        with _locked_data():
+            current = _read_json_file(OFFERS_CACHE_FILE, {}, "offers cache")
+            current.update(cache)
+            _atomic_write_json(OFFERS_CACHE_FILE, current)
+    except LocalStateError:
+        raise
+    except (OSError, TypeError, ValueError) as e:
+        log.print(f"[yellow]Could not save offers cache: {escape(str(e))}[/yellow]")
 
 
 def archive_stale_cache():
     if not os.path.exists(OFFERS_CACHE_FILE):
         return 0
-    with open(OFFERS_CACHE_FILE) as f:
-        cache = json.load(f)
-    if not cache:
+    try:
+        with _locked_data():
+            cache = _read_json_file(OFFERS_CACHE_FILE, {}, "offers cache")
+            if not cache:
+                return 0
+            today = datetime.now().strftime("%Y-%m-%d")
+            stale = {}
+            fresh = {}
+            for key, entry in cache.items():
+                if not isinstance(entry, dict):
+                    fresh[key] = entry
+                    continue
+                entry_date = entry.get("date", "")
+                if not isinstance(entry_date, str):
+                    fresh[key] = entry
+                elif entry_date < today:
+                    stale[key] = entry
+                else:
+                    fresh[key] = entry
+            if not stale:
+                return 0
+            archive = _read_json_file(
+                CACHE_ARCHIVE_FILE, [], "cache archive", expected_type=list
+            )
+            now = datetime.now(timezone.utc).isoformat()
+            archive_by_key = {}
+            for a in archive:
+                if isinstance(a, dict) and a.get("key"):
+                    archive_by_key[a["key"]] = a
+            for key, entry in stale.items():
+                archive_by_key[key] = {
+                    "archived_at": now,
+                    "key": key,
+                    "entry": entry,
+                }
+            cutoff = (
+                datetime.now() - timedelta(days=ARCHIVE_MAX_DAYS)
+            ).strftime("%Y-%m-%d")
+            archive = [
+                a for a in archive_by_key.values()
+                if isinstance(a.get("entry"), dict)
+                and isinstance(a["entry"].get("date"), str)
+                and a["entry"]["date"] >= cutoff
+            ]
+            _atomic_write_json(CACHE_ARCHIVE_FILE, archive)
+            _atomic_write_json(OFFERS_CACHE_FILE, fresh)
+            return len(stale)
+    except LocalStateError:
+        raise
+    except (OSError, TypeError, ValueError) as e:
+        log.print(f"[yellow]Could not archive offers cache: {escape(str(e))}[/yellow]")
         return 0
-    today = datetime.now().strftime("%Y-%m-%d")
-    stale = {}
-    fresh = {}
-    for key, entry in cache.items():
-        if entry.get("date", "") < today:
-            stale[key] = entry
-        else:
-            fresh[key] = entry
-    archive = []
-    if os.path.exists(CACHE_ARCHIVE_FILE):
-        with open(CACHE_ARCHIVE_FILE) as f:
-            try:
-                archive = json.load(f)
-            except (json.JSONDecodeError, OSError):
-                archive = []
-    now = datetime.now().isoformat()
-    for key, entry in stale.items():
-        archive.append({"archived_at": now, "key": key, "entry": entry})
-    cutoff = (datetime.now() - timedelta(days=ARCHIVE_MAX_DAYS)).strftime("%Y-%m-%d")
-    archive = [a for a in archive if a.get("entry", {}).get("date", "") >= cutoff]
-    with open(CACHE_ARCHIVE_FILE, "w") as f:
-        json.dump(archive, f, indent=2)
-    with open(OFFERS_CACHE_FILE, "w") as f:
-        json.dump(fresh, f, indent=2)
-    return len(stale)
 
 
 # ============================================================
@@ -1066,36 +1339,435 @@ def archive_stale_cache():
 API_URL = "https://www.qatarairways.com/dapi/public/bff/web/flight-search/flight-offers"
 
 
-def _is_cache_hit(origin, destination, date_str):
-    if _nocache:
-        return False
-    key = f"{origin}_{destination}_{date_str}"
-    cache = load_offers_cache()
-    entry = cache.get(key)
-    return bool(entry and entry.get("date") == datetime.now().strftime("%Y-%m-%d"))
+class RateLimited(Exception):
+    def __init__(self, remaining_seconds, blocked_until):
+        self.remaining_seconds = remaining_seconds
+        self.blocked_until = blocked_until
+        minutes = max(1, math.ceil(remaining_seconds / 60))
+        super().__init__(
+            f"Rate-limited: {minutes} min remaining (until {blocked_until})"
+        )
 
 
-def fetch_flights(headers, cookies, origin, destination, departure_date):
+class BudgetExceeded(Exception):
+    def __init__(self, budget):
+        self.budget = budget
+        label = "call" if budget == 1 else "calls"
+        super().__init__(f"Per-run budget exhausted ({budget} live {label})")
+
+
+class RateLimiter:
+    def __init__(
+        self,
+        state_file=None,
+        lock_file=None,
+        base_delay=None,
+        budget=None,
+        force=False,
+        clock=None,
+        sleep=None,
+        rng=None,
+    ):
+        self.state_file = RATE_STATE_FILE if state_file is None else state_file
+        self.lock_file = RATE_LOCK_FILE if lock_file is None else lock_file
+        self.base_delay = SCAN["delay_seconds"] if base_delay is None else base_delay
+        self.budget = budget
+        self.force = force
+        self.clock = clock or (lambda: datetime.now(timezone.utc))
+        self.sleep = sleep or time.sleep
+        self.rng = rng or random
+        self.calls_this_run = 0
+
+    @contextmanager
+    def _lock(self):
+        directory = os.path.dirname(self.lock_file)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        handle = open(self.lock_file, "a+")
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            yield
+        finally:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            finally:
+                handle.close()
+
+    def _parse_timestamp(self, value):
+        if isinstance(value, datetime):
+            parsed = value
+        elif isinstance(value, str):
+            try:
+                parsed = datetime.fromisoformat(value)
+            except ValueError:
+                return None
+        else:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+
+    def _read_state(self):
+        raw = {}
+        try:
+            with open(self.state_file) as f:
+                text = f.read()
+            if text.strip():
+                raw = json.loads(text)
+        except (OSError, ValueError, TypeError):
+            raw = {}
+        if not isinstance(raw, dict):
+            raw = {}
+        cutoff = self.clock() - timedelta(hours=24)
+        calls = []
+        raw_calls = raw.get("live_calls")
+        if isinstance(raw_calls, list):
+            for value in raw_calls:
+                parsed = self._parse_timestamp(value)
+                if parsed is not None and parsed >= cutoff:
+                    calls.append(parsed.isoformat())
+        blocked = self._parse_timestamp(raw.get("blocked_until"))
+        return {
+            "live_calls": calls,
+            "blocked_until": blocked.isoformat() if blocked else None,
+        }
+
+    def _write_state(self, state):
+        directory = os.path.dirname(self.state_file) or "."
+        os.makedirs(directory, exist_ok=True)
+        fd, temp_path = tempfile.mkstemp(
+            prefix=".rate_state.", suffix=".tmp", dir=directory
+        )
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(state, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temp_path, self.state_file)
+        finally:
+            if os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except OSError:
+                    pass
+
+    def _required_interval(self):
+        base = max(1, int(self.base_delay))
+        low = max(1, base - 5)
+        high = max(low, base + 10)
+        return self.rng.randint(low, high)
+
+    def _blocked_info(self):
+        with self._lock():
+            state = self._read_state()
+        blocked = self._parse_timestamp(state.get("blocked_until"))
+        if blocked is None:
+            return 0, None
+        remaining = (blocked - self.clock()).total_seconds()
+        if remaining <= 0:
+            return 0, state.get("blocked_until")
+        return math.ceil(remaining), state.get("blocked_until")
+
+    def blocked_remaining(self):
+        return self._blocked_info()[0]
+
+    def is_blocked(self):
+        return self.blocked_remaining() > 0
+
+    def record_call(self):
+        self.calls_this_run += 1
+        try:
+            with self._lock():
+                state = self._read_state()
+                state["live_calls"].append(self.clock().isoformat())
+                self._write_state(state)
+        except Exception as e:
+            log.print(f"[yellow]Rate state update failed: {e}[/yellow]")
+        if self.budget is not None:
+            log.print(f"[dim]Live calls: {self.calls_this_run}/{self.budget}[/dim]")
+
+    def wait(self):
+        remaining, blocked_until = self._blocked_info()
+        if remaining > 0 and not self.force:
+            raise RateLimited(remaining, blocked_until)
+        if self.budget is not None and self.calls_this_run >= self.budget:
+            raise BudgetExceeded(self.budget)
+        with self._lock():
+            state = self._read_state()
+            last_call = None
+            for value in state["live_calls"]:
+                parsed = self._parse_timestamp(value)
+                if parsed is not None and (last_call is None or parsed > last_call):
+                    last_call = parsed
+            now = self.clock()
+            delay = 0.0
+            if last_call is not None:
+                target = last_call + timedelta(seconds=self._required_interval())
+                if now < target:
+                    delay = (target - now).total_seconds()
+        if delay > 0:
+            log.print(f"[dim]Rate-limit pause {delay:.0f}s[/dim]")
+            self.sleep(delay)
+
+    def record_block(self, minutes=20):
+        with self._lock():
+            state = self._read_state()
+            blocked_until = self.clock() + timedelta(minutes=minutes)
+            state["blocked_until"] = blocked_until.isoformat()
+            self._write_state(state)
+
+    def clear_block(self):
+        with self._lock():
+            state = self._read_state()
+            state["blocked_until"] = None
+            self._write_state(state)
+
+
+_rate_limiter = None
+
+
+def get_rate_limiter():
+    global _rate_limiter
+    if _rate_limiter is None:
+        _rate_limiter = RateLimiter()
+    return _rate_limiter
+
+
+def configure_rate_limiter(**kwargs):
+    global _rate_limiter
+    _rate_limiter = RateLimiter(**kwargs)
+    return _rate_limiter
+
+
+def reset_rate_limiter():
+    global _rate_limiter
+    _rate_limiter = None
+
+
+class EdgeBlock(Exception):
+    def __init__(self, message, status=None, reference=None):
+        self.status = status
+        self.reference = reference
+        super().__init__(message)
+
+
+class AppAuthError(Exception):
+    pass
+
+
+class ScanAborted(Exception):
+    def __init__(self, results, reason, cause=None):
+        self.results = list(results or [])
+        self.reason = reason
+        self.cause = cause
+        super().__init__(reason)
+
+
+def _safe_body_summary(body):
+    text = " ".join((body or "").split())
+    lowered = text.lower()
+    if any(
+        marker in lowered
+        for marker in ("<html", "<!doctype", "access denied", "edgesuite")
+    ):
+        return "HTML response body (omitted)"
+    return text[:200]
+
+
+class RequestFailed(Exception):
+    def __init__(self, status, body):
+        self.status = status
+        self.body = body or ""
+        self.body_summary = _safe_body_summary(self.body)
+        if status == 0:
+            message = "Network error"
+        else:
+            message = f"HTTP {status}"
+        if self.body_summary:
+            message = f"{message}: {self.body_summary}"
+        super().__init__(message)
+
+
+def _abort_reason(exc):
+    if isinstance(exc, EdgeBlock):
+        return "edge"
+    if isinstance(exc, AppAuthError):
+        return "auth"
+    if isinstance(exc, RateLimited):
+        return "rate"
+    if isinstance(exc, BudgetExceeded):
+        return "budget"
+    raise exc
+
+
+def _abort_message(aborted):
+    cause = aborted.cause
+    if aborted.reason == "edge":
+        reference = getattr(cause, "reference", None)
+        ref_text = f" ({reference})" if reference else ""
+        return (
+            f"Blocked at Akamai edge{ref_text} \u2014 wait 15\u201330 min or refresh with `--paste`."
+        )
+    if aborted.reason == "auth":
+        return "Session rejected by the API \u2014 refresh with `--paste`."
+    if aborted.reason == "rate":
+        remaining = getattr(cause, "remaining_seconds", 0) or 0
+        minutes = max(1, math.ceil(remaining / 60))
+        return (
+            f"Rate-limit cooldown active \u2014 about {minutes} min remaining. "
+            "Use `--force` for this run or `--clear-block` to reset."
+        )
+    if aborted.reason == "budget":
+        budget = getattr(cause, "budget", "?")
+        return (
+            f"Live-call budget exhausted ({budget} calls). "
+            "Re-run later or raise `--budget`."
+        )
+    return "Scan aborted."
+
+
+def _record_block_for_abort(aborted):
+    if aborted.reason == "edge":
+        get_rate_limiter().record_block(SCAN["block_minutes"])
+
+
+def _log_error(text):
+    log.print(f"[red]{escape(str(text))}[/red]")
+
+
+def _edge_reference(body):
+    match = re.search(r"Reference #([A-Za-z0-9.]+)", body or "", re.I)
+    return match.group(1) if match else None
+
+
+def make_trace_headers():
+    trace_id = secrets.token_hex(16)
+    span_id = secrets.token_hex(8)
+    return {
+        "Request-Id": f"|{trace_id}.{span_id}",
+        "traceparent": f"00-{trace_id}-{span_id}-01",
+    }
+
+
+def build_referer(origin, destination, depart, ret):
+    params = {
+        "widget": "QR",
+        "searchType": "F",
+        "addTaxToFare": "Y",
+        "minPurTime": "0",
+        "selLang": "en",
+        "tripType": "R",
+        "fromStation": origin,
+        "toStation": destination,
+        "departing": depart,
+        "returning": ret,
+        "bookingClass": "E",
+        "adults": "1",
+        "children": "0",
+        "infants": "0",
+        "ofw": "0",
+        "teenager": "0",
+        "flexibleDate": "off",
+        "allowRedemption": "N",
+        "sort": "duration",
+    }
+    return (
+        "https://www.qatarairways.com/app/booking/flight-selection?"
+        + urlencode(params)
+    )
+
+
+def classify_block(status, body):
+    if status == 200:
+        return None
+    text = body or ""
+    lowered = text.lower()
+    if status == 403 and (
+        "<html" in lowered
+        or "access denied" in lowered
+        or "edgesuite" in lowered
+    ):
+        return "edge"
+    if status in (401, 403):
+        try:
+            json.loads(text)
+            return "auth"
+        except (TypeError, ValueError):
+            return "other"
+    return "other"
+
+
+class HttpClient:
+    def __init__(self, headers, cookies):
+        self.headers = dict(headers)
+        self.cookies = cookies
+        self.session = requests.Session()
+        self.session.cookies.update(cookies)
+
+    def post_offers(self, payload, referer):
+        headers = dict(self.headers)
+        headers.update(make_trace_headers())
+        headers["Referer"] = referer
+        resp = self.session.post(
+            API_URL,
+            headers=headers,
+            json=payload,
+            timeout=30,
+        )
+        self.cookies.update(self.session.cookies.get_dict())
+        return resp
+
+
+def _persist_cookies(cookies):
+    cfg = {}
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE) as f:
+                cfg = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            cfg = {}
+    cfg["cookies"] = cookies
+    save_config(cfg)
+
+
+def fetch_flights(headers, cookies, origin, destination, departure_date, referer=None):
     cache_key = f"{origin}_{destination}_{departure_date}"
     today = datetime.now().strftime("%Y-%m-%d")
 
+    cache = load_offers_cache()
+
     if not _nocache:
-        cache = load_offers_cache()
         entry = cache.get(cache_key)
         if entry and entry.get("date") == today:
             log.print(f"[dim]Cached {cache_key}[/dim]")
             return entry["data"], 200, None
 
+    referer = referer or headers.get("Referer", "https://www.qatarairways.com/")
     payload = build_payload(origin, destination, departure_date)
-    resp = requests.post(
-        API_URL,
-        headers=headers,
-        cookies=cookies,
-        json=payload,
-        timeout=30,
-    )
-    if resp.status_code != 200:
-        return None, resp.status_code, resp.text[:500]
+    client = HttpClient(headers, cookies)
+    limiter = get_rate_limiter()
+    limiter.wait()
+    try:
+        resp = client.post_offers(payload, referer)
+    except requests.RequestException as e:
+        raise RequestFailed(0, str(e)) from e
+    finally:
+        limiter.record_call()
+    _persist_cookies(cookies)
+
+    kind = classify_block(resp.status_code, resp.text)
+    if kind == "edge":
+        reference = _edge_reference(resp.text)
+        detail = f"HTTP {resp.status_code}, ref {reference}" if reference else f"HTTP {resp.status_code}"
+        raise EdgeBlock(
+            f"Akamai edge block ({detail})",
+            status=resp.status_code,
+            reference=reference,
+        )
+    if kind == "auth":
+        raise AppAuthError(f"Session/auth error (HTTP {resp.status_code})")
+    if kind == "other":
+        raise RequestFailed(resp.status_code, resp.text)
 
     data = resp.json()
     cache[cache_key] = {"date": today, "data": data}
@@ -1103,10 +1775,33 @@ def fetch_flights(headers, cookies, origin, destination, departure_date):
     return data, resp.status_code, None
 
 
+def _fetch_with_retries(headers, cookies, origin, destination, departure_date, referer=None):
+    attempts = 1 + SCAN["max_retries"]
+    for attempt in range(attempts):
+        try:
+            return fetch_flights(
+                headers, cookies, origin, destination, departure_date, referer=referer
+            )
+        except RequestFailed as e:
+            retryable = e.status == 0 or e.status >= 500
+            if attempt + 1 >= attempts or not retryable:
+                raise
+            log.print(
+                f"[yellow]Transient failure ({escape(str(e))}); retrying.[/yellow]"
+            )
+
+
 def _fetch_and_parse(headers, cookies, origin, destination, date_str, dep_date, ret_date, direction, max_dur):
-    data, status, err = fetch_flights(headers, cookies, origin, destination, date_str)
+    referer = build_referer(SEARCH["origin"], SEARCH["destination"], dep_date, ret_date)
+    try:
+        data, status, err = _fetch_with_retries(
+            headers, cookies, origin, destination, date_str, referer=referer
+        )
+    except RequestFailed as e:
+        _log_error(f"  {e}")
+        return []
     if data is None:
-        log.print(f"[red]  HTTP {status}: {err}[/red]")
+        _log_error(f"  HTTP {status}: {err}")
         return []
     results = parse_results(data, max_dur)
     convert_prices(results)
@@ -1157,7 +1852,11 @@ def parse_args(argv=None):
     p.add_argument("--nofilter", action="store_true", help="Disable max-price filtering, show all results")
     p.add_argument("--drift", type=int, default=None, metavar="N", help="Scan drift: ±N days shifting both outbound+return together")
     p.add_argument("--drift-ret", type=int, default=None, metavar="N", help="Scan drift on return only: ±N days shifting return date, outbound fixed")
-    p.add_argument("--delay", type=int, default=None, metavar="SEC", help="Delay between scan requests (default 10 for drift, 20 for scan)")
+    p.add_argument("--delay", type=int, default=None, metavar="SEC", help="Base spacing between live calls in seconds (default 45, jittered -5/+10)")
+    p.add_argument("--max-retries", type=int, choices=[0, 1], default=0, metavar="{0,1}", help="Retry transient 5xx/timeout failures once (edge/auth/rate/budget are never retried)")
+    p.add_argument("--budget", type=int, default=None, metavar="N", help="Maximum live POST attempts per run (default: unlimited)")
+    p.add_argument("--force", action="store_true", help="Ignore an active rate-limit cooldown for this run")
+    p.add_argument("--clear-block", action="store_true", help="Clear the persisted rate-limit cooldown and exit")
     p.add_argument("--price-map", action="store_true", help="Show price map (day-of-week price trends from collected data)")
     p.add_argument("--recommend", type=int, default=None, const=10, nargs="?", metavar="N", help="Show top N mixed-cabin combos (default 10)")
     p.add_argument("--all-fares", action="store_true", help="Include BUSINESS_LITE, BUSINESS_ELITE (excluded by default; ECONOMY_LITE/FIRST always hidden)")
@@ -1198,35 +1897,40 @@ def _scan_dates(headers, cookies, args, max_price, weight, max_dur, top_n, raw, 
     dates_to_check = [base + timedelta(days=i) for i in range(-before, after + 1)]
     total = len(dates_to_check)
 
-    for idx, d in enumerate(dates_to_check):
-        trip = (fixed - d).days if direction == "OB" else (d - fixed).days
-        if trip < min_trip:
-            log.print(f"[dim]Skipping {d}: trip={trip}d < min {min_trip}d[/dim]")
-            continue
-        date_str = d.isoformat()
-        log.print(f"[cyan]{label} request {idx+1}/{total}: {d}[/cyan]")
-        dep_date = date_str if direction == "OB" else fixed.isoformat()
-        ret_date = fixed.isoformat() if direction == "OB" else date_str
-        results = _fetch_and_parse(headers, cookies, origin, dest, date_str, dep_date, ret_date, direction, max_dur)
-        all_results.extend(results)
-        if idx < total - 1:
-            next_d = dates_to_check[idx + 1].isoformat()
-            if not _is_cache_hit(origin, dest, next_d):
-                delay = args.delay if args.delay is not None else SCAN["delay_seconds"]
-                log.print(f"  [dim]Waiting {delay}s...[/dim]")
-                time.sleep(delay)
+    aborted = None
+    try:
+        for idx, d in enumerate(dates_to_check):
+            trip = (fixed - d).days if direction == "OB" else (d - fixed).days
+            if trip < min_trip:
+                log.print(f"[dim]Skipping {d}: trip={trip}d < min {min_trip}d[/dim]")
+                continue
+            date_str = d.isoformat()
+            log.print(f"[cyan]{label} request {idx+1}/{total}: {d}[/cyan]")
+            dep_date = date_str if direction == "OB" else fixed.isoformat()
+            ret_date = fixed.isoformat() if direction == "OB" else date_str
+            results = _fetch_and_parse(headers, cookies, origin, dest, date_str, dep_date, ret_date, direction, max_dur)
+            all_results.extend(results)
+    except (EdgeBlock, AppAuthError, RateLimited, BudgetExceeded) as exc:
+        aborted = exc
 
     update_price_map(all_results)
     all_results = filter_dirt_cheap(all_results)
 
     if raw:
-        return all_results
-    filtered = filter_results(all_results, max_price, max_dur)
-    if not filtered:
-        log.print("[yellow]No results passed filters (max price/duration).[/yellow]")
-        return []
-    scored = score_results(filtered, weight)
-    return scored[:top_n]
+        final = all_results
+    else:
+        filtered = filter_results(all_results, max_price, max_dur)
+        if not filtered:
+            if aborted is None:
+                log.print("[yellow]No results passed filters (max price/duration).[/yellow]")
+            final = []
+        else:
+            final = score_results(filtered, weight)[:top_n]
+
+    if aborted is not None:
+        log.print(f"[yellow]Scan aborted; showing {len(final)} partial result(s).[/yellow]")
+        raise ScanAborted(final, _abort_reason(aborted), aborted) from aborted
+    return final
 
 
 def scan_outbound(headers, cookies, args, max_price, weight, max_dur, top_n, raw=False):
@@ -1247,108 +1951,108 @@ def drift_scan(headers, cookies, args, max_price, max_dur):
     base_rb = datetime.strptime(SEARCH["return_date"], "%Y-%m-%d").date()
     trip_days = (base_rb - base_ob).days
     drift = args.drift
-    delay = args.delay if args.delay is not None else 10
 
     all_results = []
     offsets = list(range(-drift, drift + 1))
 
     total = len(offsets)
 
-    for idx, offset in enumerate(offsets):
-        ob_date = base_ob + timedelta(days=offset)
-        rb_date = base_rb + timedelta(days=offset)
-        ob_str = ob_date.isoformat()
-        rb_str = rb_date.isoformat()
-        log.print(f"[cyan]Drift {idx+1}/{total}: {ob_date} \u2192 {rb_date} ({trip_days}d trip)[/cyan]")
+    aborted = None
+    try:
+        for idx, offset in enumerate(offsets):
+            ob_date = base_ob + timedelta(days=offset)
+            rb_date = base_rb + timedelta(days=offset)
+            ob_str = ob_date.isoformat()
+            rb_str = rb_date.isoformat()
+            log.print(f"[cyan]Drift {idx+1}/{total}: {ob_date} \u2192 {rb_date} ({trip_days}d trip)[/cyan]")
 
-        results = _fetch_and_parse(headers, cookies, SEARCH["origin"], SEARCH["destination"], ob_str, ob_str, rb_str, "OB", max_dur)
-        all_results.extend(results)
+            results = _fetch_and_parse(headers, cookies, SEARCH["origin"], SEARCH["destination"], ob_str, ob_str, rb_str, "OB", max_dur)
+            all_results.extend(results)
 
-        if not _is_cache_hit(SEARCH["destination"], SEARCH["origin"], rb_str):
-            time.sleep(delay)
-
-        results = _fetch_and_parse(headers, cookies, SEARCH["destination"], SEARCH["origin"], rb_str, ob_str, rb_str, "RB", max_dur)
-        all_results.extend(results)
-
-        if idx < total - 1:
-            next_ob = (base_ob + timedelta(days=offsets[idx + 1])).isoformat()
-            next_rb = (base_rb + timedelta(days=offsets[idx + 1])).isoformat()
-            ob_hit = _is_cache_hit(SEARCH["origin"], SEARCH["destination"], next_ob)
-            rb_hit = _is_cache_hit(SEARCH["destination"], SEARCH["origin"], next_rb)
-            if not (ob_hit and rb_hit):
-                time.sleep(delay)
+            results = _fetch_and_parse(headers, cookies, SEARCH["destination"], SEARCH["origin"], rb_str, ob_str, rb_str, "RB", max_dur)
+            all_results.extend(results)
+    except (EdgeBlock, AppAuthError, RateLimited, BudgetExceeded) as exc:
+        aborted = exc
 
     update_price_map(all_results)
     all_results = filter_dirt_cheap(all_results)
 
     if not all_results:
-        return []
+        final = []
+    elif args.nofilter:
+        final = all_results
+    else:
+        filtered = filter_results(all_results, max_price, max_dur)
+        if not filtered:
+            if aborted is None:
+                log.print("[yellow]No results passed filters (max price/duration).[/yellow]")
+            final = []
+        else:
+            final = filtered
 
-    if args.nofilter:
-        return all_results
-    filtered = filter_results(all_results, max_price, max_dur)
-    if not filtered:
-        log.print("[yellow]No results passed filters (max price/duration).[/yellow]")
-        return []
-    return filtered
+    if aborted is not None:
+        log.print(f"[yellow]Scan aborted; showing {len(final)} partial result(s).[/yellow]")
+        raise ScanAborted(final, _abort_reason(aborted), aborted) from aborted
+    return final
 
 
 def drift_scan_return(headers, cookies, args, max_price, max_dur):
     base_ob = datetime.strptime(SEARCH["departure_date"], "%Y-%m-%d").date()
     base_rb = datetime.strptime(SEARCH["return_date"], "%Y-%m-%d").date()
     drift = args.drift_ret
-    delay = args.delay if args.delay is not None else 10
 
     all_results = []
     offsets = list(range(-drift, drift + 1))
 
     total = len(offsets)
 
-    for idx, offset in enumerate(offsets):
-        ob_date = base_ob
-        rb_date = base_rb + timedelta(days=offset)
-        ob_str = ob_date.isoformat()
-        rb_str = rb_date.isoformat()
-        trip_days = (rb_date - ob_date).days
+    aborted = None
+    try:
+        for idx, offset in enumerate(offsets):
+            ob_date = base_ob
+            rb_date = base_rb + timedelta(days=offset)
+            ob_str = ob_date.isoformat()
+            rb_str = rb_date.isoformat()
+            trip_days = (rb_date - ob_date).days
 
-        if rb_date <= ob_date:
-            log.print(f"[dim]Skipping {rb_date}: return before or equal to departure[/dim]")
-            continue
-        min_trip = args.min_trip if args.min_trip is not None else SCAN["min_trip_days"]
-        if trip_days < min_trip:
-            log.print(f"[dim]Skipping {rb_date}: trip={trip_days}d < min {min_trip}d[/dim]")
-            continue
+            if rb_date <= ob_date:
+                log.print(f"[dim]Skipping {rb_date}: return before or equal to departure[/dim]")
+                continue
+            min_trip = args.min_trip if args.min_trip is not None else SCAN["min_trip_days"]
+            if trip_days < min_trip:
+                log.print(f"[dim]Skipping {rb_date}: trip={trip_days}d < min {min_trip}d[/dim]")
+                continue
 
-        log.print(f"[cyan]Drift-Ret {idx+1}/{total}: {ob_date} \u2192 {rb_date} ({trip_days}d trip)[/cyan]")
+            log.print(f"[cyan]Drift-Ret {idx+1}/{total}: {ob_date} \u2192 {rb_date} ({trip_days}d trip)[/cyan]")
 
-        results = _fetch_and_parse(headers, cookies, SEARCH["origin"], SEARCH["destination"], ob_str, ob_str, rb_str, "OB", max_dur)
-        all_results.extend(results)
+            results = _fetch_and_parse(headers, cookies, SEARCH["origin"], SEARCH["destination"], ob_str, ob_str, rb_str, "OB", max_dur)
+            all_results.extend(results)
 
-        if not _is_cache_hit(SEARCH["destination"], SEARCH["origin"], rb_str):
-            time.sleep(delay)
-
-        results = _fetch_and_parse(headers, cookies, SEARCH["destination"], SEARCH["origin"], rb_str, ob_str, rb_str, "RB", max_dur)
-        all_results.extend(results)
-
-        if idx < total - 1:
-            next_rb = (base_rb + timedelta(days=offsets[idx + 1])).isoformat()
-            rb_hit = _is_cache_hit(SEARCH["destination"], SEARCH["origin"], next_rb)
-            if not rb_hit:
-                time.sleep(delay)
+            results = _fetch_and_parse(headers, cookies, SEARCH["destination"], SEARCH["origin"], rb_str, ob_str, rb_str, "RB", max_dur)
+            all_results.extend(results)
+    except (EdgeBlock, AppAuthError, RateLimited, BudgetExceeded) as exc:
+        aborted = exc
 
     update_price_map(all_results)
     all_results = filter_dirt_cheap(all_results)
 
     if not all_results:
-        return []
+        final = []
+    elif args.nofilter:
+        final = all_results
+    else:
+        filtered = filter_results(all_results, max_price, max_dur)
+        if not filtered:
+            if aborted is None:
+                log.print("[yellow]No results passed filters (max price/duration).[/yellow]")
+            final = []
+        else:
+            final = filtered
 
-    if args.nofilter:
-        return all_results
-    filtered = filter_results(all_results, max_price, max_dur)
-    if not filtered:
-        log.print("[yellow]No results passed filters (max price/duration).[/yellow]")
-        return []
-    return filtered
+    if aborted is not None:
+        log.print(f"[yellow]Scan aborted; showing {len(final)} partial result(s).[/yellow]")
+        raise ScanAborted(final, _abort_reason(aborted), aborted) from aborted
+    return final
 
 
 def print_drift_pair_table(results, title=None, filter_note=None):
@@ -1586,7 +2290,33 @@ def print_booking_links(results):
 
 
 def main():
+    try:
+        _main()
+    except LocalStateError as e:
+        log.print(f"[red]{escape(str(e))}[/red]")
+        sys.exit(1)
+
+
+def _main():
     args = parse_args()
+    SCAN["max_retries"] = max(0, min(1, args.max_retries))
+    configure_rate_limiter(
+        base_delay=args.delay if args.delay is not None else SCAN["delay_seconds"],
+        budget=args.budget,
+        force=args.force,
+    )
+
+    if args.clear_block:
+        get_rate_limiter().clear_block()
+        log.print("[green]Rate-limit cooldown cleared.[/green]")
+        return
+
+    if args.force:
+        limiter = get_rate_limiter()
+        if limiter.is_blocked():
+            log.print(
+                "[yellow]Ignoring active cooldown (--force); it remains on disk.[/yellow]"
+            )
 
     # -- paste mode
     if args.paste:
@@ -1603,7 +2333,7 @@ def main():
         print_price_map()
         return
 
-    headers = cfg["headers"]
+    headers = cfg.get("headers", {})
     cookies = cfg.get("cookies", {})
 
     set_nocache(args.nocache)
@@ -1631,6 +2361,9 @@ def main():
         if args.trends:
             print_price_trends(SEARCH["origin"], SEARCH["destination"], archive_prices=archive_prices)
         return
+
+    if not validate_config(cfg):
+        sys.exit(1)
 
     # CLI overrides for search params
     if args.origin:
@@ -1701,73 +2434,134 @@ def main():
         if price_filter_active:
             filter_note = f"Filtered by max price: ECONOMY \u2264 {max_price.get('ECONOMY','?')} NOK, BUSINESS \u2264 {max_price.get('BUSINESS','?')} NOK"
 
+    def display_outbound_partial(results):
+        ob_label = f"Outbound \u2014  {SEARCH['origin']}\u2192{SEARCH['destination']}  {SEARCH['departure_date']}"
+        if args.json:
+            print_json_combined({"outbound": merge_cabins(results), "return": []})
+        else:
+            print_compare_table(merge_cabins(results), title=ob_label, filter_note=filter_note)
+        if args.urls and results:
+            print_booking_links(results)
+
     if args.drift is not None:
         log.rule("[bold cyan]Drift scan[/bold cyan]")
-        all_results = drift_scan(headers, cookies, args, max_price, max_dur)
+        aborted = None
+        try:
+            all_results = drift_scan(headers, cookies, args, max_price, max_dur)
+        except ScanAborted as e:
+            all_results = e.results
+            aborted = e
+        if aborted is not None and aborted.reason == "edge":
+            _record_block_for_abort(aborted)
+        if all_results:
+            label = f"Drift scan \u2014 {SEARCH['origin']}\u2192{SEARCH['destination']} (max {max_dur}h)"
+            print_drift_pair_table(all_results, title=label, filter_note=filter_note)
+            merged = merge_cabins(all_results)
+            print_drift_summary(merged)
+            if args.recommend:
+                combos = find_best_mixed(all_results, top_n=args.recommend)
+                print_mixed_table(combos)
+            if args.urls:
+                print_booking_links(all_results)
+        if aborted is not None:
+            _log_error(_abort_message(aborted))
+            sys.exit(1)
         if not all_results:
             return
-        label = f"Drift scan \u2014 {SEARCH['origin']}\u2192{SEARCH['destination']} (max {max_dur}h)"
-        print_drift_pair_table(all_results, title=label, filter_note=filter_note)
-        merged = merge_cabins(all_results)
-        print_drift_summary(merged)
-        if args.recommend:
-            combos = find_best_mixed(all_results, top_n=args.recommend)
-            print_mixed_table(combos)
-        if args.urls:
-            print_booking_links(all_results)
     elif args.drift_ret is not None:
         log.rule("[bold cyan]Drift-Ret scan[/bold cyan]")
-        all_results = drift_scan_return(headers, cookies, args, max_price, max_dur)
+        aborted = None
+        try:
+            all_results = drift_scan_return(headers, cookies, args, max_price, max_dur)
+        except ScanAborted as e:
+            all_results = e.results
+            aborted = e
+        if aborted is not None and aborted.reason == "edge":
+            _record_block_for_abort(aborted)
+        if all_results:
+            label = f"Drift-Ret \u2014 {SEARCH['origin']}\u2192{SEARCH['destination']} (max {max_dur}h)"
+            print_drift_pair_table(all_results, title=label, filter_note=filter_note)
+            merged = merge_cabins(all_results)
+            print_drift_summary(merged)
+            if args.recommend:
+                combos = find_best_mixed(all_results, top_n=args.recommend)
+                print_mixed_table(combos)
+            if args.urls:
+                print_booking_links(all_results)
+        if aborted is not None:
+            _log_error(_abort_message(aborted))
+            sys.exit(1)
         if not all_results:
             return
-        label = f"Drift-Ret \u2014 {SEARCH['origin']}\u2192{SEARCH['destination']} (max {max_dur}h)"
-        print_drift_pair_table(all_results, title=label, filter_note=filter_note)
-        merged = merge_cabins(all_results)
-        print_drift_summary(merged)
-        if args.recommend:
-            combos = find_best_mixed(all_results, top_n=args.recommend)
-            print_mixed_table(combos)
-        if args.urls:
-            print_booking_links(all_results)
     elif in_scan_mode:
         scan_ob = args.ob is not None or (args.scan and args.rb is None)
         scan_rb = args.rb is not None
 
         all_results = []
+        aborted = None
+        try:
+            if scan_ob:
+                log.rule("[bold cyan]Scanning outbound dates[/bold cyan]")
+                top = scan_outbound(headers, cookies, args, max_price, weight, max_dur, top_n, raw=True)
+                all_results.extend(top)
 
-        if scan_ob:
-            log.rule("[bold cyan]Scanning outbound dates[/bold cyan]")
-            top = scan_outbound(headers, cookies, args, max_price, weight, max_dur, top_n, raw=True)
-            all_results.extend(top)
+            if scan_rb:
+                log.rule("[bold cyan]Scanning return dates[/bold cyan]")
+                top = scan_return(headers, cookies, args, max_price, weight, max_dur, top_n, raw=True)
+                all_results.extend(top)
+        except ScanAborted as e:
+            all_results.extend(e.results)
+            aborted = e
 
-        if scan_rb:
-            log.rule("[bold cyan]Scanning return dates[/bold cyan]")
-            top = scan_return(headers, cookies, args, max_price, weight, max_dur, top_n, raw=True)
-            all_results.extend(top)
+        if aborted is not None and aborted.reason == "edge":
+            _record_block_for_abort(aborted)
 
-        if not all_results:
+        if all_results:
+            if not args.nofilter:
+                all_results = filter_results(all_results, max_price, max_dur)
+            all_results = score_results(all_results, weight)[:top_n]
+
+            label = (
+                f"Scan results"
+                f" (max {max_dur}h, max price: {max_price})"
+            )
+            display(all_results, title=label)
+        elif aborted is None:
             log.print("[yellow]No results after scan + filtering.[/yellow]")
             return
 
-        if not args.nofilter:
-            all_results = filter_results(all_results, max_price, max_dur)
-        all_results = score_results(all_results, weight)[:top_n]
-
-        label = (
-            f"Scan results"
-            f" (max {max_dur}h, max price: {max_price})"
-        )
-        display(all_results, title=label)
+        if aborted is not None:
+            _log_error(_abort_message(aborted))
+            sys.exit(1)
     else:
         # --- Outbound call ---
         log.print(
             f"[bold]Outbound:[/bold] {SEARCH['origin']} \u2192 {SEARCH['destination']} on {SEARCH['departure_date']}"
         )
-        ob_data, ob_status, ob_err = fetch_flights(
-            headers, cookies, SEARCH["origin"], SEARCH["destination"], SEARCH["departure_date"]
-        )
+        try:
+            ob_data, ob_status, ob_err = _fetch_with_retries(
+                headers,
+                cookies,
+                SEARCH["origin"],
+                SEARCH["destination"],
+                SEARCH["departure_date"],
+                referer=build_referer(
+                    SEARCH["origin"],
+                    SEARCH["destination"],
+                    SEARCH["departure_date"],
+                    SEARCH["return_date"],
+                ),
+            )
+        except (EdgeBlock, AppAuthError, RateLimited, BudgetExceeded) as e:
+            aborted = ScanAborted([], _abort_reason(e), e)
+            _record_block_for_abort(aborted)
+            _log_error(_abort_message(aborted))
+            sys.exit(1)
+        except RequestFailed as e:
+            _log_error(f"Outbound: {e}")
+            sys.exit(1)
         if ob_data is None:
-            log.print(f"[red]Outbound HTTP {ob_status}: {ob_err}[/red]")
+            _log_error(f"Outbound HTTP {ob_status}: {ob_err}")
             sys.exit(1)
         ob_results = parse_results(ob_data, max_dur)
         convert_prices(ob_results)
@@ -1782,11 +2576,34 @@ def main():
         log.print(
             f"[bold]Return:[/bold] {SEARCH['destination']} \u2192 {SEARCH['origin']} on {SEARCH['return_date']}"
         )
-        rb_data, rb_status, rb_err = fetch_flights(
-            headers, cookies, SEARCH["destination"], SEARCH["origin"], SEARCH["return_date"]
-        )
+        try:
+            rb_data, rb_status, rb_err = _fetch_with_retries(
+                headers,
+                cookies,
+                SEARCH["destination"],
+                SEARCH["origin"],
+                SEARCH["return_date"],
+                referer=build_referer(
+                    SEARCH["origin"],
+                    SEARCH["destination"],
+                    SEARCH["departure_date"],
+                    SEARCH["return_date"],
+                ),
+            )
+        except (EdgeBlock, AppAuthError, RateLimited, BudgetExceeded) as e:
+            update_price_map(ob_results)
+            aborted = ScanAborted([], _abort_reason(e), e)
+            _record_block_for_abort(aborted)
+            display_outbound_partial(ob_results)
+            _log_error(_abort_message(aborted))
+            sys.exit(1)
+        except RequestFailed as e:
+            display_outbound_partial(ob_results)
+            _log_error(f"Return: {e}")
+            sys.exit(1)
         if rb_data is None:
-            log.print(f"[red]Return HTTP {rb_status}: {rb_err}[/red]")
+            display_outbound_partial(ob_results)
+            _log_error(f"Return HTTP {rb_status}: {rb_err}")
             sys.exit(1)
         rb_results = parse_results(rb_data, max_dur)
         convert_prices(rb_results)
