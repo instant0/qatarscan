@@ -142,6 +142,10 @@ class LocalStateError(Exception):
     pass
 
 
+class RateStateError(LocalStateError):
+    pass
+
+
 def _atomic_write_json(path, data):
     directory = os.path.dirname(os.path.abspath(path))
     fd, tmp_path = tempfile.mkstemp(prefix=".tmp-", suffix=".json", dir=directory)
@@ -465,12 +469,59 @@ def booking_url(origin, destination, dep_date, ret_date, cabin):
 
 
 def extract_avios(fare):
-    for item in fare.get("fareFamilyFeatures", []):
-        if item.get("type") == "EARNED_MILES":
-            params = item.get("parameters")
-            if params and len(params) > 0:
-                return params[0]
+    if not isinstance(fare, dict):
+        return None
+    features = fare.get("fareFamilyFeatures")
+    if not isinstance(features, list):
+        return None
+    for item in features:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") != "EARNED_MILES":
+            continue
+        params = item.get("parameters")
+        if not isinstance(params, list):
+            continue
+        if params:
+            return params[0]
     return None
+
+
+def _valid_number(value):
+    if isinstance(value, bool):
+        return None
+    if not isinstance(value, (int, float)):
+        return None
+    if not math.isfinite(value) or value < 0:
+        return None
+    return value
+
+
+def _valid_rate(value):
+    if isinstance(value, bool):
+        return False
+    if not isinstance(value, (int, float)):
+        return False
+    return math.isfinite(value) and value > 0
+
+
+def _valid_rate_entry(entry):
+    if not isinstance(entry, dict):
+        return False
+    date = entry.get("date")
+    if not isinstance(date, str) or not date:
+        return False
+    return _valid_rate(entry.get("rate"))
+
+
+def _valid_iso_datetime(value):
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return value
 
 
 # ============================================================
@@ -497,34 +548,71 @@ def save_currency_rates(rates):
 
 
 def get_conversion_rate(target_currency):
-    if target_currency == "NOK":
+    if not isinstance(target_currency, str):
+        log.print("[yellow]Invalid FX currency code; no conversion.[/yellow]")
+        return None
+    code = target_currency.strip().upper()
+    if len(code) != 3 or not code.isascii() or not code.isalpha():
+        log.print(
+            f"[yellow]Invalid FX currency code {escape(str(target_currency))}; no conversion.[/yellow]"
+        )
+        return None
+    if code == "NOK":
         return 1.0
-    key = f"{target_currency}_NOK"
-    if key in _currency_rates:
-        return _currency_rates[key]
-    disk = load_currency_rates()
-    entry = disk.get(key)
+    key = f"{code}_NOK"
     today = datetime.now().strftime("%Y-%m-%d")
-    if entry and entry.get("date") == today:
-        _currency_rates[key] = entry["rate"]
-        return entry["rate"]
-    base = target_currency.lower()
+
+    memory = _currency_rates.get(key)
+    memory_entry = memory if _valid_rate_entry(memory) else None
+    if memory_entry and memory_entry["date"] == today:
+        return memory_entry["rate"]
+
+    disk = load_currency_rates()
+    disk_entry = disk.get(key)
+    if not _valid_rate_entry(disk_entry):
+        disk_entry = None
+    if disk_entry and disk_entry["date"] == today:
+        _currency_rates[key] = disk_entry
+        return disk_entry["rate"]
+
+    fallback = None
+    for candidate in (disk_entry, memory_entry):
+        if candidate is not None and candidate["date"] != today:
+            fallback = candidate
+            break
+
+    base = code.lower()
     url = f"https://cdn.jsdelivr.net/gh/irfanokr/currency-api@main/v1/currencies/{base}.json"
     try:
         resp = requests.get(url, timeout=15)
         resp.raise_for_status()
         data = resp.json()
-        rate = data[base]["nok"]
+        if not isinstance(data, dict):
+            raise ValueError("invalid FX payload")
+        base_data = data.get(base)
+        if not isinstance(base_data, dict):
+            raise ValueError("invalid FX payload")
+        rate = base_data.get("nok")
+        if not _valid_rate(rate):
+            raise ValueError("invalid FX rate")
     except Exception as e:
-        log.print(f"[yellow]FX rate fetch failed ({target_currency}\u2192NOK): {e}[/yellow]")
-        if entry:
-            _currency_rates[key] = entry["rate"]
-            return entry["rate"]
+        if fallback is not None:
+            log.print(
+                f"[yellow]FX rate fetch failed ({code}\u2192NOK): {escape(str(e))}; "
+                f"using cached rate from {escape(fallback['date'])}[/yellow]"
+            )
+            _currency_rates[key] = fallback
+            return fallback["rate"]
+        log.print(
+            f"[yellow]FX rate fetch failed ({code}\u2192NOK): {escape(str(e))}; "
+            "no conversion.[/yellow]"
+        )
         return None
+    disk = load_currency_rates()
     disk[key] = {"rate": rate, "date": today}
     save_currency_rates(disk)
-    _currency_rates[key] = rate
-    log.print(f"[dim]FX rate: 1 {target_currency} = {rate} NOK[/dim]")
+    _currency_rates[key] = disk[key]
+    log.print(f"[dim]FX rate: 1 {code} = {rate} NOK[/dim]")
     return rate
 
 
@@ -555,59 +643,111 @@ def build_payload(origin, destination, departure_date):
 # ============================================================
 
 
-def parse_results(data, max_duration_hours=None):
+def parse_results(data, max_duration_hours=None, warn=True):
+    if not isinstance(data, dict):
+        raise RequestFailed(200, "Malformed flight-offers payload")
+    offers = data.get("flightOffers", [])
+    if not isinstance(offers, list):
+        raise RequestFailed(200, "Malformed flight-offers payload")
+
     output = []
+    skipped_offers = 0
+    skipped_fares = 0
+    skipped_segments = 0
     max_stops = PREFERENCES.get("max_stops")
-    for offer in data.get("flightOffers", []):
-        dur_sec = offer.get("duration")
-        if max_duration_hours and dur_sec and dur_sec > max_duration_hours * 3600:
+
+    for offer in offers:
+        if not isinstance(offer, dict):
+            skipped_offers += 1
             continue
-        if max_stops is not None and (offer.get("numberOfStops") or 0) > max_stops:
+
+        raw_duration = _valid_number(offer.get("duration"))
+        raw_stops = _valid_number(offer.get("numberOfStops"))
+        stops = raw_stops if raw_stops is not None else 0
+
+        if max_duration_hours and raw_duration is not None and raw_duration > max_duration_hours * 3600:
             continue
+        if max_stops is not None and stops > max_stops:
+            continue
+
+        raw_segments = offer.get("segments", [])
+        if not isinstance(raw_segments, list) or not raw_segments:
+            skipped_offers += 1
+            continue
+
+        bad_segments = sum(1 for seg in raw_segments if not isinstance(seg, dict))
+        if bad_segments:
+            skipped_segments += bad_segments
+            skipped_offers += 1
+            continue
+
         segments = []
         avoid = False
-        for seg in offer.get("segments", []):
-            aircraft = seg.get("vehicle", {})
-            dep = seg.get("departure", {})
-            arr = seg.get("arrival", {})
-            if arr.get("destination", {}).get("iataCode") in PREFERENCES["avoid_airports"]:
+        for seg in raw_segments:
+            aircraft = seg.get("vehicle")
+            if not isinstance(aircraft, dict):
+                aircraft = {}
+            dep = seg.get("departure")
+            if not isinstance(dep, dict):
+                dep = {}
+            arr = seg.get("arrival")
+            if not isinstance(arr, dict):
+                arr = {}
+            destination = arr.get("destination")
+            if isinstance(destination, dict) and destination.get("iataCode") in PREFERENCES["avoid_airports"]:
                 avoid = True
             raw_name = aircraft.get("name", "")
+            if not isinstance(raw_name, str):
+                raw_name = ""
             short_name = raw_name.split(" ", 1)[-1] if " " in raw_name else raw_name
             layout = classify_layout(
                 aircraft.get("code"),
                 seg.get("flightNumber"),
                 seg.get("qSuiteEquipped"),
             )
+            segment_duration = _valid_number(seg.get("duration"))
             segments.append({
                 "flight": seg.get("flightNumber"),
                 "aircraft": short_name,
                 "aircraft_code": aircraft.get("shortName"),
                 "layout": layout,
-                "departure": dep.get("dateTime"),
-                "arrival": arr.get("dateTime"),
+                "departure": _valid_iso_datetime(dep.get("dateTime")),
+                "arrival": _valid_iso_datetime(arr.get("dateTime")),
                 "qSuite": seg.get("qSuiteEquipped"),
-                "duration": hhmm(seg.get("duration")),
+                "duration": hhmm(segment_duration),
             })
+        if not segments or not segments[0]["departure"]:
+            skipped_offers += 1
+            continue
         if avoid:
             continue
-        for fare in offer.get("fareOffers", []):
+
+        raw_fares = offer.get("fareOffers", [])
+        if not isinstance(raw_fares, list):
+            skipped_offers += 1
+            continue
+
+        for fare in raw_fares:
+            if not isinstance(fare, dict):
+                skipped_fares += 1
+                continue
             cabin = fare.get("cabinType")
             family = fare.get("fareFamilyCode")
             if cabin not in PREFERENCES["show_cabins"]:
                 continue
             if family not in PREFERENCES["show_fares"]:
                 continue
-            price_info = fare.get("price", {})
-            if not price_info:
+            price_info = fare.get("price")
+            if not isinstance(price_info, dict) or not price_info:
+                skipped_fares += 1
                 continue
             output.append({
-                "origin": offer.get("origin", {}).get("iataCode"),
-                "destination": offer.get("destination", {}).get("iataCode"),
-                "departure_date": segments[0]["departure"][:10] if segments else None,
-                "duration": hhmm(offer.get("duration")),
-                "duration_seconds": offer.get("duration"),
-                "stops": offer.get("numberOfStops"),
+                "origin": offer.get("origin", {}).get("iataCode") if isinstance(offer.get("origin"), dict) else None,
+                "destination": offer.get("destination", {}).get("iataCode") if isinstance(offer.get("destination"), dict) else None,
+                "departure_date": segments[0]["departure"][:10],
+                "duration": hhmm(raw_duration),
+                "duration_seconds": raw_duration,
+                "stops": stops,
                 "segments": segments,
                 "fare": family,
                 "cabin": cabin,
@@ -616,6 +756,12 @@ def parse_results(data, max_duration_hours=None):
                 "avios": extract_avios(fare),
                 "available_seats": fare.get("availableSeats"),
             })
+
+    if warn and (skipped_offers or skipped_fares or skipped_segments):
+        log.print(
+            f"[yellow]Skipped malformed response data: {skipped_offers} offer(s), "
+            f"{skipped_fares} fare(s), {skipped_segments} segment(s).[/yellow]"
+        )
     return output
 
 
@@ -624,15 +770,36 @@ def parse_results(data, max_duration_hours=None):
 # ============================================================
 
 
-def convert_prices(results):
+def convert_prices(results, warn=True):
+    skipped = 0
     for r in results:
-        cur = r.get("currency")
-        if cur and cur != "NOK":
-            rate = get_conversion_rate(cur)
-            if rate:
-                r["price"] = round(r["price"] * rate)
-                r["currency"] = "NOK"
-                r["_converted"] = True
+        if not isinstance(r, dict):
+            skipped += 1
+            continue
+        price = r.get("price")
+        currency = r.get("currency")
+        if not _valid_number(price):
+            skipped += 1
+            continue
+        if not isinstance(currency, str) or not currency.strip():
+            skipped += 1
+            continue
+        code = currency.strip().upper()
+        if code == "NOK":
+            r["currency"] = "NOK"
+            continue
+        rate = get_conversion_rate(code)
+        if not _valid_rate(rate):
+            skipped += 1
+            continue
+        r["price"] = round(price * rate)
+        r["currency"] = "NOK"
+        r["_converted"] = True
+    if warn and skipped:
+        log.print(
+            f"[yellow]Skipped {skipped} price conversion(s) with missing/invalid "
+            "price, currency, or rate.[/yellow]"
+        )
     return results
 
 
@@ -839,10 +1006,10 @@ def _load_archive_prices():
         date_str = "_".join(parts[2:])
         direction_dir = f"{origin}_{destination}"
         try:
-            parsed = parse_results(data)
+            parsed = parse_results(data, warn=False)
         except Exception:
             continue
-        convert_prices(parsed)
+        convert_prices(parsed, warn=False)
         for r in parsed:
             fare = r.get("fare")
             price = r.get("price")
@@ -1340,13 +1507,23 @@ API_URL = "https://www.qatarairways.com/dapi/public/bff/web/flight-search/flight
 
 
 class RateLimited(Exception):
-    def __init__(self, remaining_seconds, blocked_until):
+    def __init__(self, remaining_seconds, blocked_until, state_error=False):
         self.remaining_seconds = remaining_seconds
         self.blocked_until = blocked_until
-        minutes = max(1, math.ceil(remaining_seconds / 60))
-        super().__init__(
-            f"Rate-limited: {minutes} min remaining (until {blocked_until})"
-        )
+        self.state_error = state_error
+        if state_error:
+            minutes = max(1, math.ceil(remaining_seconds / 60)) if remaining_seconds is not None else None
+            if minutes is not None:
+                super().__init__(
+                    f"Rate-limited (state error): {minutes} min fallback (until {blocked_until})"
+                )
+            else:
+                super().__init__("Rate-limited (state error)")
+        else:
+            minutes = max(1, math.ceil(remaining_seconds / 60))
+            super().__init__(
+                f"Rate-limited: {minutes} min remaining (until {blocked_until})"
+            )
 
 
 class BudgetExceeded(Exception):
@@ -1408,29 +1585,55 @@ class RateLimiter:
         return parsed.astimezone(timezone.utc)
 
     def _read_state(self):
-        raw = {}
         try:
-            with open(self.state_file) as f:
-                text = f.read()
-            if text.strip():
+            try:
+                with open(self.state_file) as f:
+                    text = f.read()
+            except FileNotFoundError:
+                return {"live_calls": [], "blocked_until": None}
+            except OSError as e:
+                raise RateStateError(
+                    "Rate-limit state file unreadable. Run `--clear-block` to reset it."
+                ) from e
+            if not text.strip():
+                return {"live_calls": [], "blocked_until": None}
+            try:
                 raw = json.loads(text)
-        except (OSError, ValueError, TypeError):
-            raw = {}
-        if not isinstance(raw, dict):
-            raw = {}
-        cutoff = self.clock() - timedelta(hours=24)
-        calls = []
-        raw_calls = raw.get("live_calls")
-        if isinstance(raw_calls, list):
-            for value in raw_calls:
-                parsed = self._parse_timestamp(value)
-                if parsed is not None and parsed >= cutoff:
-                    calls.append(parsed.isoformat())
-        blocked = self._parse_timestamp(raw.get("blocked_until"))
-        return {
-            "live_calls": calls,
-            "blocked_until": blocked.isoformat() if blocked else None,
-        }
+            except (ValueError, TypeError) as e:
+                raise RateStateError(
+                    "Rate-limit state is corrupt or unreadable. Run `--clear-block` to reset it."
+                ) from e
+            if not isinstance(raw, dict):
+                raise RateStateError(
+                    "Rate-limit state is corrupt or unreadable. Run `--clear-block` to reset it."
+                )
+            blocked_value = raw.get("blocked_until")
+            if blocked_value is not None:
+                blocked = self._parse_timestamp(blocked_value)
+                if blocked is None:
+                    raise RateStateError(
+                        "Rate-limit state is corrupt or unreadable. Run `--clear-block` to reset it."
+                    )
+            else:
+                blocked = None
+            cutoff = self.clock() - timedelta(hours=24)
+            calls = []
+            raw_calls = raw.get("live_calls")
+            if isinstance(raw_calls, list):
+                for value in raw_calls:
+                    parsed = self._parse_timestamp(value)
+                    if parsed is not None and parsed >= cutoff:
+                        calls.append(parsed.isoformat())
+            return {
+                "live_calls": calls,
+                "blocked_until": blocked.isoformat() if blocked else None,
+            }
+        except RateStateError:
+            raise
+        except Exception as e:
+            raise RateStateError(
+                "Rate-limit state is corrupt or unreadable. Run `--clear-block` to reset it."
+            ) from e
 
     def _write_state(self, state):
         directory = os.path.dirname(self.state_file) or "."
@@ -1458,8 +1661,12 @@ class RateLimiter:
         return self.rng.randint(low, high)
 
     def _blocked_info(self):
-        with self._lock():
-            state = self._read_state()
+        try:
+            with self._lock():
+                state = self._read_state()
+        except RateStateError:
+            fallback_seconds = max(1, int(SCAN.get("block_minutes", 20)) * 60)
+            return fallback_seconds, None
         blocked = self._parse_timestamp(state.get("blocked_until"))
         if blocked is None:
             return 0, None
@@ -1469,58 +1676,141 @@ class RateLimiter:
         return math.ceil(remaining), state.get("blocked_until")
 
     def blocked_remaining(self):
-        return self._blocked_info()[0]
+        try:
+            return self._blocked_info()[0]
+        except Exception:
+            return max(1, int(SCAN.get("block_minutes", 20)) * 60)
 
     def is_blocked(self):
-        return self.blocked_remaining() > 0
+        try:
+            return self.blocked_remaining() > 0
+        except Exception:
+            return True
 
     def record_call(self):
         self.calls_this_run += 1
         try:
             with self._lock():
-                state = self._read_state()
+                try:
+                    state = self._read_state()
+                except RateStateError:
+                    log.print("[yellow]Rate-limit state is corrupt or unreadable; skipping rate-state update.[/yellow]")
+                    if self.budget is not None:
+                        log.print(f"[dim]Live calls: {self.calls_this_run}/{self.budget}[/dim]")
+                    return
+                if not isinstance(state.get("live_calls"), list):
+                    state["live_calls"] = []
                 state["live_calls"].append(self.clock().isoformat())
                 self._write_state(state)
         except Exception as e:
-            log.print(f"[yellow]Rate state update failed: {e}[/yellow]")
+            log.print(f"[yellow]Rate state update failed: {escape(str(e))}[/yellow]")
         if self.budget is not None:
             log.print(f"[dim]Live calls: {self.calls_this_run}/{self.budget}[/dim]")
 
     def wait(self):
-        remaining, blocked_until = self._blocked_info()
-        if remaining > 0 and not self.force:
-            raise RateLimited(remaining, blocked_until)
-        if self.budget is not None and self.calls_this_run >= self.budget:
-            raise BudgetExceeded(self.budget)
-        with self._lock():
-            state = self._read_state()
-            last_call = None
-            for value in state["live_calls"]:
-                parsed = self._parse_timestamp(value)
-                if parsed is not None and (last_call is None or parsed > last_call):
-                    last_call = parsed
-            now = self.clock()
-            delay = 0.0
-            if last_call is not None:
-                target = last_call + timedelta(seconds=self._required_interval())
-                if now < target:
-                    delay = (target - now).total_seconds()
-        if delay > 0:
-            log.print(f"[dim]Rate-limit pause {delay:.0f}s[/dim]")
-            self.sleep(delay)
+        while True:
+            if self.budget is not None and self.calls_this_run >= self.budget:
+                raise BudgetExceeded(self.budget)
+            try:
+                with self._lock():
+                    try:
+                        state = self._read_state()
+                    except RateStateError:
+                        fallback_seconds = max(1, int(SCAN.get("block_minutes", 20)) * 60)
+                        synthetic_until = (
+                            self.clock() + timedelta(seconds=fallback_seconds)
+                        ).isoformat()
+                        log.print(
+                            "[yellow]Rate-limit state is corrupt or unreadable. "
+                            "Run `--clear-block` to reset it.[/yellow]"
+                        )
+                        raise RateLimited(
+                            fallback_seconds,
+                            synthetic_until,
+                            state_error=True,
+                        )
+                    blocked = self._parse_timestamp(state.get("blocked_until"))
+                    now = self.clock()
+                    if blocked is not None and blocked > now:
+                        if self.force:
+                            pass
+                        else:
+                            remaining = math.ceil((blocked - now).total_seconds())
+                            raise RateLimited(remaining, blocked.isoformat(), state_error=False)
+                    last_call = None
+                    for value in state.get("live_calls", []):
+                        parsed = self._parse_timestamp(value)
+                        if parsed is not None and (last_call is None or parsed > last_call):
+                            last_call = parsed
+                    delay = 0.0
+                    if last_call is not None:
+                        target = last_call + timedelta(seconds=self._required_interval())
+                        if now < target:
+                            delay = (target - now).total_seconds()
+            except RateLimited:
+                raise
+            except BudgetExceeded:
+                raise
+            except Exception as e:
+                raise
+            if delay > 0:
+                log.print(f"[dim]Rate-limit pause {delay:.0f}s[/dim]")
+                self.sleep(delay)
+                continue
+            break
 
     def record_block(self, minutes=20):
-        with self._lock():
-            state = self._read_state()
-            blocked_until = self.clock() + timedelta(minutes=minutes)
-            state["blocked_until"] = blocked_until.isoformat()
-            self._write_state(state)
+        try:
+            with self._lock():
+                try:
+                    state = self._read_state()
+                except RateStateError:
+                    log.print(
+                        "[yellow]Could not record rate-limit block due to corrupt/unreadable state; "
+                        "run `--clear-block` to reset it.[/yellow]"
+                    )
+                    return
+                blocked_until = self.clock() + timedelta(minutes=minutes)
+                candidate = blocked_until.isoformat()
+                existing = self._parse_timestamp(state.get("blocked_until"))
+                if existing is not None and existing >= blocked_until:
+                    return
+                state["blocked_until"] = candidate
+                if not isinstance(state.get("live_calls"), list):
+                    state["live_calls"] = []
+                self._write_state(state)
+        except RateStateError:
+            log.print(
+                "[yellow]Could not record rate-limit block due to corrupt/unreadable state; "
+                "run `--clear-block` to reset it.[/yellow]"
+            )
+            return
+        except Exception as e:
+            log.print(f"[yellow]Could not record rate-limit block: {escape(str(e))}[/yellow]")
+            return
 
     def clear_block(self):
-        with self._lock():
-            state = self._read_state()
-            state["blocked_until"] = None
-            self._write_state(state)
+        try:
+            with self._lock():
+                try:
+                    state = self._read_state()
+                    state["blocked_until"] = None
+                    if not isinstance(state.get("live_calls"), list):
+                        state["live_calls"] = []
+                    self._write_state(state)
+                except RateStateError:
+                    clean_state = {"live_calls": [], "blocked_until": None}
+                    try:
+                        self._write_state(clean_state)
+                    except Exception as e:
+                        raise LocalStateError(
+                            f"Failed to clear corrupt rate-limit state: {e}"
+                        ) from e
+                    return
+        except LocalStateError:
+            raise
+        except Exception as e:
+            raise LocalStateError(f"Failed to clear rate-limit state: {e}") from e
 
 
 _rate_limiter = None
@@ -1611,6 +1901,11 @@ def _abort_message(aborted):
     if aborted.reason == "auth":
         return "Session rejected by the API \u2014 refresh with `--paste`."
     if aborted.reason == "rate":
+        if getattr(cause, "state_error", False):
+            return (
+                "Rate-limit state is corrupt or unreadable. "
+                "Run `--clear-block` to reset it."
+            )
         remaining = getattr(cause, "remaining_seconds", 0) or 0
         minutes = max(1, math.ceil(remaining / 60))
         return (
@@ -1769,7 +2064,10 @@ def fetch_flights(headers, cookies, origin, destination, departure_date, referer
     if kind == "other":
         raise RequestFailed(resp.status_code, resp.text)
 
-    data = resp.json()
+    try:
+        data = resp.json()
+    except ValueError as e:
+        raise RequestFailed(resp.status_code, "Non-JSON response") from e
     cache[cache_key] = {"date": today, "data": data}
     save_offers_cache(cache)
     return data, resp.status_code, None
@@ -1803,7 +2101,11 @@ def _fetch_and_parse(headers, cookies, origin, destination, date_str, dep_date, 
     if data is None:
         _log_error(f"  HTTP {status}: {err}")
         return []
-    results = parse_results(data, max_dur)
+    try:
+        results = parse_results(data, max_dur)
+    except RequestFailed as e:
+        _log_error(f"  {e}")
+        return []
     convert_prices(results)
     for r in results:
         r["_dep_date"] = dep_date
@@ -2563,7 +2865,11 @@ def _main():
         if ob_data is None:
             _log_error(f"Outbound HTTP {ob_status}: {ob_err}")
             sys.exit(1)
-        ob_results = parse_results(ob_data, max_dur)
+        try:
+            ob_results = parse_results(ob_data, max_dur)
+        except RequestFailed as e:
+            _log_error(f"Outbound: {e}")
+            sys.exit(1)
         convert_prices(ob_results)
         for r in ob_results:
             r["_dep_date"] = SEARCH["departure_date"]
@@ -2605,7 +2911,12 @@ def _main():
             display_outbound_partial(ob_results)
             _log_error(f"Return HTTP {rb_status}: {rb_err}")
             sys.exit(1)
-        rb_results = parse_results(rb_data, max_dur)
+        try:
+            rb_results = parse_results(rb_data, max_dur)
+        except RequestFailed as e:
+            display_outbound_partial(ob_results)
+            _log_error(f"Return: {e}")
+            sys.exit(1)
         convert_prices(rb_results)
         for r in rb_results:
             r["_dep_date"] = SEARCH["departure_date"]

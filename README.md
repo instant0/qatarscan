@@ -73,9 +73,10 @@ Flags:
   --json                    Output raw JSON
   --delay SEC               Base spacing between live calls in seconds (default 45, jittered -5/+10)
   --max-retries {0,1}       Retry transient 5xx/timeout failures once (default 0; edge/auth/rate/budget are never retried)
-  --budget N                Maximum live POST attempts per run (default: unlimited)
+  --budget N                Max live POST calls per run (0 = no limit). Failed/timed-out calls count; cache hits do not.
   --force                   Ignore an active rate-limit cooldown for this run
   --clear-block             Clear the persisted rate-limit cooldown and exit
+  Corrupt/unreadable rate-limit state fails closed. `--force` does not bypass unusable state; use `--clear-block` to reset it.
   --help                    Show this help
 ```
 

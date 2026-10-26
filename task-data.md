@@ -20,9 +20,9 @@ task documents in `tasks/`. Each task links here instead of repeating shared det
 | T06 | Yes | Pending | T01–T05, T09–T14 | Verification & rate calibration |
 | T07 | Optional | Pending | T03 | TLS impersonation (`curl_cffi`) |
 | T08 | Optional | Pending | T02 | Playwright warm-up (cookie harvesting) |
-| T09 | Yes | Pending | T03, T05, T10 | Response parsing & FX conversion hardening |
+| T09 | Yes | **Done** (2026-10-26) | T03, T05, T10 | Response parsing & FX conversion hardening |
 | T10 | Yes | **Done** (2026-10-26) | T01, T05 | Durable JSON state persistence |
-| T11 | Yes | Pending | T04, T05 | Rate limiter and cooldown hardening |
+| T11 | Yes | Done (2026-10-26) | T04, T05 | Rate limiter and cooldown hardening |
 | T12 | Yes | Pending | T03, T05 | CLI, output, and local-mode correctness |
 | T13 | Yes | Pending | T02, T03, T10 | Request-header, config, and cookie hardening |
 | T14 | Yes | Pending | T09–T13 | Documentation and test-contract cleanup |

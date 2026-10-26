@@ -664,3 +664,12 @@ class SourceInvariantTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AbortMessageStateErrorTests(unittest.TestCase):
+    def test_rate_state_error_message(self):
+        cause = flights.RateLimited(1200, "2026-10-26T12:20:00+00:00", state_error=True)
+        message = flights._abort_message(flights.ScanAborted([], "rate", cause))
+        self.assertIn("corrupt", message)
+        self.assertIn("--clear-block", message)
+        self.assertNotIn("--force", message)

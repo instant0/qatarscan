@@ -1,6 +1,6 @@
 # TASK: Restore reliable `flight-offers` scanning (Akamai 403 mitigation)
 
-Status: Phase 1 implemented through T05 and T10 (2026-10-26); post-review remediation T09, T11–T14 pending, then T06 verification
+Status: Phase 1 implemented through T05, T09, T10, T11 (2026-10-26); post-review remediation T12–T14 pending, then T06 verification
 Owner: (unassigned)
 Related: `flights.py`, `config.json`, `api.md`, `README.md`
 Execution tasks: `tasks/` (index in `task-data.md` §0)
@@ -24,6 +24,9 @@ Deferred research: `TASK_FARE_CALENDAR.md`
   No runtime code changed in this review pass.
 - 2026-10-26 — T10 durable JSON persistence shipped: atomic/locked writes, corruption
   quarantine, merge-on-save, and guarded read-only state views. Full suite passes (78 tests).
+- 2026-10-26 — T09 response parsing and FX hardening shipped: non-JSON/malformed 200s are
+  typed transient failures, parsing skips bad offers/fares/segments, and FX/cache entries are
+  validated before use. Full suite passes (98 tests).
 
 ---
 
@@ -279,12 +282,12 @@ needed.
 |------|---------|----------|
 | T09 | Non-JSON/malformed 200s and unsafe FX/price conversion | High |
 | T10 | Non-atomic/unguarded offers cache, archive, price map, currency writes | High |
-| T11 | Cooldown race, fail-open corrupt state, abort-masking block writes | Medium |
+| T11 | Cooldown race, fail-open corrupt state, abort-masking block writes | Done (2026-10-26) |
 | T12 | Rich-markup JSON corruption, `--urls`/JSON conflicts, local-mode/config and exit-code bugs | Medium |
 | T13 | Header policy not enforced at send time; config/cookie fragility; incomplete `_abck` warning; unbounded error bodies | Medium |
 | T14 | README/TASK/task-data contradictions and remaining regression-test gaps | Medium |
 
-T10 is fixed (2026-10-26); T09, T11–T14 remain.
+T09–T11 fixed (2026-10-26); T12–T14 remain.
 
 Historical note: issue 9 was fixed in T01; the `--nocache` diagnostic path remains covered by
 `tests/test_nocache.py`.
