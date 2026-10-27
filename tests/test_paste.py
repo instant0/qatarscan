@@ -87,6 +87,93 @@ class PasteTests(unittest.TestCase):
                 self.assertNotIn(name, cookies)
         self.assertEqual(flights._abck_state(cookies), "valid")
 
+    def test_chromium_capture_keeps_client_hints_and_bm_cookies(self):
+        text = """POST /dapi/public/bff/web/flight-search/flight-offers HTTP/2
+Host: www.qatarairways.com
+User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36 Edg/151.0.0.0
+Accept: application/json, text/plain, */*
+Accept-Language: en
+Content-Type: application/json
+qr-lang: en
+session-id: 11111111-2222-3333-4444-555555555555
+X-AssignedDeviceID: tJJ90PH6M2LvV1v8hfdPZYWh0LTSurze
+nbx_fs_api_key: 74f2474702784207a9785eb3ef8ae4e4
+Origin: https://www.qatarairways.com
+Referer: https://www.qatarairways.com/app/booking/flight-selection
+Priority: u=1, i
+Sec-CH-UA: "Not=A?Brand";v="99", "Microsoft Edge";v="151", "Chromium";v="151"
+Sec-CH-UA-Mobile: ?0
+Sec-CH-UA-Platform: "Windows"
+Cookie: _abck=VAL~0~sensor~-1~-1; bm_mi=mi~1; bm_sz=sz; bm_sv=sv; ak_bmsc=bmsc; AKA_A2=A; ASLBSA=lbsa; ASLBSACORS=lbsc; TS01753a24=ts; ai_user=u; AMCV_x=adobe; OptanonConsent=consent; mbox=box"""
+        headers, cookies, source = flights.parse_pasted_headers(text)
+        self.assertEqual(source, "flight-offers")
+        self.assertEqual(
+            headers["Sec-CH-UA"],
+            '"Not=A?Brand";v="99", "Microsoft Edge";v="151", "Chromium";v="151"',
+        )
+        self.assertEqual(headers["Sec-CH-UA-Mobile"], "?0")
+        self.assertEqual(headers["Sec-CH-UA-Platform"], '"Windows"')
+        self.assertEqual(headers["Priority"], "u=1, i")
+        for name in ("_abck", "bm_mi", "bm_sz", "bm_sv", "ak_bmsc", "AKA_A2", "ASLBSA", "ASLBSACORS", "TS01753a24"):
+            with self.subTest(cookie=name):
+                self.assertIn(name, cookies)
+        for name in ("ai_user", "AMCV_x", "OptanonConsent", "mbox"):
+            with self.subTest(excluded_cookie=name):
+                self.assertNotIn(name, cookies)
+        self.assertEqual(flights._abck_state(cookies), "valid")
+
+    def test_edge_two_line_header_list(self):
+        text = "\n".join(
+            [
+                ":authority",
+                "www.qatarairways.com",
+                ":method",
+                "POST",
+                ":path",
+                "/dapi/public/bff/web/flight-search/flight-offers",
+                ":scheme",
+                "https",
+                "accept",
+                "application/json, text/plain, */*",
+                "accept-language",
+                "en",
+                "content-type",
+                "application/json",
+                "user-agent",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36 Edg/151.0.0.0",
+                "session-id",
+                "11111111-2222-3333-4444-555555555555",
+                "x-assigneddeviceid",
+                "tJJ90PH6M2LvV1v8hfdPZYWh0LTSurze",
+                "nbx_fs_api_key",
+                "74f2474702784207a9785eb3ef8ae4e4",
+                "origin",
+                "https://www.qatarairways.com",
+                "referer",
+                "https://www.qatarairways.com/app/booking/flight-selection",
+                "cookie",
+                "_abck=VAL~0~sensor; bm_mi=mi~1; ai_user=x",
+            ]
+        )
+        headers, cookies, source = flights.parse_pasted_headers(text)
+        self.assertEqual(source, "flight-offers")
+        self.assertEqual(headers["User-Agent"].split()[-1], "Edg/151.0.0.0")
+        self.assertEqual(
+            headers["Referer"],
+            "https://www.qatarairways.com/app/booking/flight-selection",
+        )
+        self.assertIn("bm_mi", cookies)
+        self.assertNotIn("ai_user", cookies)
+
+    def test_colonless_separator_and_json_hint(self):
+        text = PASTE.replace(": ", ":")
+        headers, _, source = flights.parse_pasted_headers(text)
+        self.assertEqual(source, "flight-offers")
+        self.assertEqual(headers["session-id"], "6b0a6ca4-8105-45c4-8693-5f3c6a4c747a")
+        with self.assertRaisesRegex(flights.PasteError, "JSON/HAR"):
+            flights.parse_pasted_headers('{"headers": {"session-id": "x"}}')
+
     def test_invalid_paste_inputs_rejected(self):
         cases = {
             "wrong_endpoint": PASTE.replace(

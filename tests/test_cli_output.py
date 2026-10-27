@@ -791,6 +791,112 @@ class CliValidationTests(unittest.TestCase):
         self.assertIsNone(flights.RateLimiter(budget=0).budget)
 
 
+class SortingTests(unittest.TestCase):
+    def test_date_is_primary_over_price_and_duration(self):
+        outbound = make_result(
+            flight="QR1", price=9000, dep_date="2026-08-17", direction="OB"
+        )
+        outbound["duration_seconds"] = 72000
+        returning = make_result(
+            flight="QR2",
+            price=1000,
+            dep_date="2026-09-04",
+            direction="RB",
+            origin="BKK",
+            destination="OSL",
+        )
+        returning["duration_seconds"] = 18000
+        for order in ("duration", "price"):
+            with self.subTest(order=order):
+                ordered = flights.sort_results([returning, outbound], order)
+                self.assertEqual([r["segments"][0]["flight"] for r in ordered], ["QR1", "QR2"])
+
+    def test_default_order_is_duration_then_price_within_date(self):
+        slow = make_result(flight="QR1", price=9000, dep_date="2026-08-17")
+        slow["duration_seconds"] = 72000
+        fast_expensive = make_result(
+            flight="QR2", price=9000, dep_date="2026-08-17"
+        )
+        fast_expensive["duration_seconds"] = 36000
+        fast_cheap = make_result(flight="QR3", price=5000, dep_date="2026-08-17")
+        fast_cheap["duration_seconds"] = 36000
+        ordered = flights.sort_results(
+            [slow, fast_expensive, fast_cheap], "duration"
+        )
+        self.assertEqual(
+            [r["segments"][0]["flight"] for r in ordered], ["QR3", "QR2", "QR1"]
+        )
+
+    def test_price_override_keeps_date_primary(self):
+        cheap_slow = make_result(flight="QR1", price=4000, dep_date="2026-08-17")
+        cheap_slow["duration_seconds"] = 72000
+        expensive_fast = make_result(
+            flight="QR2", price=8000, dep_date="2026-08-17"
+        )
+        expensive_fast["duration_seconds"] = 36000
+        later_cheap = make_result(
+            flight="QR3", price=1000, dep_date="2026-08-18"
+        )
+        later_cheap["duration_seconds"] = 18000
+        ordered = flights.sort_results(
+            [expensive_fast, later_cheap, cheap_slow], "price"
+        )
+        self.assertEqual(
+            [r["segments"][0]["flight"] for r in ordered], ["QR1", "QR2", "QR3"]
+        )
+
+    def test_same_date_outbound_sorts_before_return(self):
+        outbound = make_result(
+            flight="QR1", price=9000, dep_date="2026-08-17", direction="OB"
+        )
+        returning = make_result(
+            flight="QR2",
+            price=1000,
+            dep_date="2026-08-17",
+            direction="RB",
+            origin="BKK",
+            destination="OSL",
+        )
+        ordered = flights.sort_results([returning, outbound], "price")
+        self.assertEqual([r["segments"][0]["flight"] for r in ordered], ["QR1", "QR2"])
+
+    def test_limit_scan_results_ranks_then_displays_in_date_order(self):
+        durations = [72000, 36000, 18000, 108000]
+        results = []
+        for i, duration in enumerate(durations):
+            outbound = make_result(
+                flight=f"OB{i}",
+                dep_date=f"2026-08-{10 + i}",
+                direction="OB",
+            )
+            outbound["duration_seconds"] = duration
+            results.append(outbound)
+            returning = make_result(
+                flight=f"RB{i}",
+                dep_date=f"2026-09-{10 + i}",
+                direction="RB",
+                origin="BKK",
+                destination="OSL",
+            )
+            returning["duration_seconds"] = duration
+            results.append(returning)
+        limited = flights.limit_scan_results(results, "duration", 2)
+        self.assertEqual(
+            [r["segments"][0]["flight"] for r in limited],
+            ["OB1", "OB2", "RB1", "RB2"],
+        )
+
+    def test_sort_flag_is_alias_for_weight_and_defaults_to_duration(self):
+        self.assertEqual(flights.SCAN["weight"], "duration")
+        self.assertEqual(
+            flights.parse_args(["--sort", "price"]).weight, "price"
+        )
+        self.assertEqual(
+            flights.parse_args(["--weight", "duration"]).weight, "duration"
+        )
+        self.assertIsNone(flights.parse_args([]).weight)
+
+
 class LocalModeTests(unittest.TestCase):
     def test_local_modes_run_without_config_but_live_requires_it(self):
         with self.subTest(mode="price_map"):
@@ -872,6 +978,38 @@ class LocalModeTests(unittest.TestCase):
         self.assertEqual(list(cache), [fresh_key])
         self.assertIn("Pruned", err)
         self.assertNotIn("No saved config", err)
+
+
+class PasteOnlyTests(unittest.TestCase):
+    def test_paste_only_saves_and_exits_without_live_call(self):
+        args = make_args(paste=True)
+        with patch.object(flights, "parse_args", return_value=args):
+            with patch.object(
+                flights,
+                "prompt_paste_headers",
+                return_value={"headers": {}, "cookies": {}},
+            ) as prompt:
+                with patch.object(flights, "configure_rate_limiter"):
+                    with patch.object(flights, "load_config") as load:
+                        with patch.object(flights, "_fetch_with_retries") as fetch:
+                            with patch.object(flights.log, "print"):
+                                flights._main(["--paste"])
+        prompt.assert_called_once_with()
+        load.assert_not_called()
+        fetch.assert_not_called()
+
+    def test_paste_with_other_args_continues(self):
+        args = make_args(paste=True, price_map=True)
+        with patch.object(flights, "parse_args", return_value=args):
+            with patch.object(
+                flights,
+                "prompt_paste_headers",
+                return_value={"headers": {}, "cookies": {}},
+            ):
+                with patch.object(flights, "configure_rate_limiter"):
+                    with patch.object(flights, "print_price_map") as printer:
+                        flights._main(["--paste", "--price-map"])
+        printer.assert_called_once_with()
 
 
 class TransientStatsTests(unittest.TestCase):

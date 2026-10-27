@@ -103,15 +103,32 @@ One itinerary per call; outbound and return are **separate** calls.
 - `User-Agent` (must match the pasted session/TLS profile)
 - `Accept: application/json, text/plain, */*`
 - `Accept-Language: en`
-- `Sec-GPC: 1`
+- `Sec-GPC: 1` (Firefox only)
 - `Sec-Fetch-Dest: empty`, `Sec-Fetch-Mode: cors`, `Sec-Fetch-Site: same-origin`
 - `Pragma: no-cache`, `Cache-Control: no-cache`
+- `Sec-CH-UA`, `Sec-CH-UA-Mobile`, `Sec-CH-UA-Platform` (Chromium/Edge only; keep only when
+  the pasted `User-Agent` is Chromium-based)
+- `Priority: u=1, i` (Chromium/Edge; only meaningful over HTTP/2, harmless over HTTP/1.1)
+
+### Header fidelity rules
+- The pasted `User-Agent` determines the profile. Do not mix a Firefox UA with `Sec-CH-UA*`
+  (Firefox does not send them), and do not mix a Chromium UA with `Sec-GPC`/Firefox-only
+  headers.
+- Keep a capture together: `User-Agent` + `Sec-CH-UA*` + `Accept-Language` must come from the
+  same browser/session as `session-id`, `X-AssignedDeviceID`, and the cookies.
+- `Referer` is rebuilt per search. The browser capture omits `sort=duration`; our extra
+  `sort` parameter is harmless but is a minor mismatch (see T16).
+- HTTP/2 pseudo-headers (`:authority`, `:method`, `:path`, `:scheme`) are never stored or sent;
+  the HTTP library generates them.
+- `Accept-Encoding` is not stored; the transport negotiates it (see below). A Chromium capture
+  normally shows `gzip, deflate, br, zstd`; sending that with plain `requests` requires
+  `brotli`/`zstandard`, otherwise the response cannot be decoded.
 
 ### Do not copy / do not send
 - Do **not** copy `Host` or `Content-Length`; `requests` computes them.
 - Do **not** send `Accept-Encoding: br, zstd` with plain `requests` unless
   `brotli`/`zstandard` are installed. Keep the library default (or use `curl_cffi`).
-- Do **not** copy analytics cookies (see §5).
+- Do **not** copy analytics/consent cookies (see §5).
 - This policy is enforced both at paste time and at send time (`_sanitize_headers()` in
   `HttpClient`), so an old/polluted `config.json` cannot reintroduce `Host`,
   `Content-Length`, `Connection`, `TE`, `Transfer-Encoding`, `Accept-Encoding`, or `Cookie`
@@ -140,9 +157,20 @@ traceparent: 00-{trace-id}-{span-id}-01
 Use an **allowlist**, not a blocklist.
 
 Keep/echo:
-- Akamai/sensor: `_abck`, `bm_sz`, `bm_sv`, `ak_bmsc`
-- Load-balancer: `BIGipServer*`
+- Akamai/sensor: `_abck`, `bm_*` (notably `bm_sz`, `bm_sv`, `bm_mi`), `ak_bmsc`
+- Load-balancer: `BIGipServer*`, `ASLBSA`, `ASLBSACORS`
 - Session/gateway: `AKA_A2`, `TS01753a24`, `TS01163f70` (keep all `TS0*`)
+
+A real captured `flight-offers` request (Edge 151, 2026-10-27) sent: `TS01753a24`, `AKA_A2`,
+`ak_bmsc`, `country`, `ai_user`, `drcookie`, `accepted_functional`, `accepted_marketing`,
+`country_geo`, `OptanonAlertBoxClosed`, `at_check`, `AMCV_*`, `OptanonConsent`, `mbox`,
+`compStartSrc`, `ASLBSA`, `ASLBSACORS`, `bm_mi`, `bm_sz`, `_abck`, `ai_session`, `bm_sv`.
+The allowlist above keeps the functional subset; `bm_mi` was previously dropped and is part of
+Akamai Bot Manager, so it matters.
+
+Not needed for the API (keep dropped unless evidence says otherwise): `country`,
+`country_geo`, `drcookie`, `at_check`, `accepted_functional`, `accepted_marketing`,
+`compStartSrc` (app/consent state), and all analytics/marketing cookies.
 
 Drop: analytics/marketing (`_ga*`, `AMCV*`, `OptanonConsent`, `s_*`, `mbox`, `_fbp`,
 `_gcl_au`, `kndctr_*`, `FPID`, `FPLC`, `ai_user`, `ai_session`, etc.).

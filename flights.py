@@ -110,7 +110,7 @@ SCAN = {
     "delay_seconds": 45,
     "max_duration_hours": 25,
     "max_price": {"ECONOMY": 9000, "BUSINESS": 21000},
-    "weight": "price",
+    "weight": "duration",
     "top_n": 5,
     "min_trip_days": 8,
     "block_minutes": 20,
@@ -136,6 +136,14 @@ LAYOUT_RANK = {"QSuite": 4, "Door": 3, "Pod": 2, "Old": 1, "Unknown": 0}
 
 console = Console()
 log = Console(stderr=True)
+
+
+def _clean_layout_map(mapping):
+    return {
+        key: value
+        for key, value in mapping.items()
+        if isinstance(key, str) and key and isinstance(value, str) and value
+    }
 
 
 def load_layouts():
@@ -166,8 +174,15 @@ def load_layouts():
             "using empty layout maps.[/yellow]"
         )
         return default
-    data["aircraft"] = aircraft
-    data["by_flight"] = by_flight
+    clean_aircraft = _clean_layout_map(aircraft)
+    clean_by_flight = _clean_layout_map(by_flight)
+    if len(clean_aircraft) != len(aircraft) or len(clean_by_flight) != len(by_flight):
+        log.print(
+            "[yellow]layouts.json has invalid entries (names and layouts must be "
+            "non-empty strings); ignoring them.[/yellow]"
+        )
+    data["aircraft"] = clean_aircraft
+    data["by_flight"] = clean_by_flight
     return data
 
 
@@ -180,11 +195,15 @@ def classify_layout(aircraft_code, flight_number, qsuite):
     if not isinstance(layouts, dict):
         return "Unknown"
     by_flight = layouts.get("by_flight", {})
-    if isinstance(by_flight, dict) and flight_number in by_flight:
-        return by_flight[flight_number]
+    if isinstance(by_flight, dict):
+        value = by_flight.get(flight_number)
+        if isinstance(value, str) and value:
+            return value
     ac_map = layouts.get("aircraft", {})
     if isinstance(ac_map, dict):
-        return ac_map.get(aircraft_code, "Unknown")
+        value = ac_map.get(aircraft_code)
+        if isinstance(value, str) and value:
+            return value
     return "Unknown"
 
 
@@ -409,10 +428,14 @@ CANONICAL_HEADERS = {
     "content-type": "Content-Type",
     "request-id": "Request-Id",
     "traceparent": "traceparent",
+    "priority": "Priority",
+    "sec-ch-ua": "Sec-CH-UA",
+    "sec-ch-ua-mobile": "Sec-CH-UA-Mobile",
+    "sec-ch-ua-platform": "Sec-CH-UA-Platform",
 }
 
-COOKIE_ALLOWLIST = {"_abck", "bm_sz", "bm_sv", "ak_bmsc", "AKA_A2"}
-COOKIE_ALLOWLIST_PREFIXES = ("BIGipServer", "TS0")
+COOKIE_ALLOWLIST = {"_abck", "bm_sz", "bm_sv", "ak_bmsc", "AKA_A2", "ASLBSA", "ASLBSACORS"}
+COOKIE_ALLOWLIST_PREFIXES = ("BIGipServer", "TS0", "bm_")
 
 FORBIDDEN_SEND_HEADERS = {
     "host",
@@ -423,6 +446,12 @@ FORBIDDEN_SEND_HEADERS = {
     "accept-encoding",
     "cookie",
 }
+
+PARSE_DROP_HEADERS = frozenset(
+    {"content-length", "connection", "te", "transfer-encoding", "accept-encoding"}
+)
+PAIR_KEYS = frozenset(CANONICAL_HEADERS) | {"cookie", "host"} | PARSE_DROP_HEADERS
+REQUEST_METHODS = ("POST", "GET", "PUT", "PATCH", "DELETE")
 
 
 def _cookie_allowed(name):
@@ -463,27 +492,21 @@ def parse_pasted_headers(text):
     path = None
     host = None
     saw_request_line = False
+    pending = None
 
-    for line in text.strip().splitlines():
-        line = line.strip()
-        if not line:
-            continue
-
-        parts = line.split()
-        if parts and parts[0].upper() in ("POST", "GET", "PUT", "PATCH", "DELETE"):
-            if len(parts) >= 2:
-                method = parts[0].upper()
-                path = parts[1]
-                saw_request_line = True
-            continue
-
-        if ": " not in line:
-            continue
-        key, value = line.split(": ", 1)
-        key = key.strip()
-        value = value.strip()
-        lower = key.lower()
-
+    def store(lower, value):
+        nonlocal host, method, path
+        if lower == ":method":
+            method = value.upper()
+            return
+        if lower == ":path":
+            path = value
+            return
+        if lower == ":authority":
+            host = value
+            return
+        if lower == ":scheme":
+            return
         if lower == "cookie":
             for part in value.split(";"):
                 if "=" in part:
@@ -491,24 +514,65 @@ def parse_pasted_headers(text):
                     ck = ck.strip()
                     if _cookie_allowed(ck):
                         cookies[ck] = cv.strip()
-            continue
-
+            return
         if lower == "host":
             host = value
-            continue
-
-        if lower in (
-            "content-length",
-            "connection",
-            "te",
-            "transfer-encoding",
-            "accept-encoding",
-        ):
-            continue
-
+            return
+        if lower in PARSE_DROP_HEADERS:
+            return
         canonical = CANONICAL_HEADERS.get(lower)
         if canonical:
             headers[canonical] = value
+
+    for raw in text.strip().splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+
+        if pending is not None:
+            store(pending, line)
+            pending = None
+            continue
+
+        parts = line.split()
+        if parts and parts[0].upper() in REQUEST_METHODS:
+            if len(parts) >= 2:
+                method = parts[0].upper()
+                path = parts[1]
+                saw_request_line = True
+            continue
+
+        if line.startswith(":"):
+            pending = line if line in (":method", ":path", ":authority", ":scheme") else None
+            continue
+
+        if ":" in line:
+            key, value = line.split(":", 1)
+            key = key.strip()
+            value = value.strip()
+            if key:
+                store(key.lower(), value)
+            continue
+
+        lower = line.lower()
+        if lower in PAIR_KEYS:
+            pending = lower
+
+    if method is not None and path is not None:
+        saw_request_line = True
+
+    stripped = text.strip()
+    if not headers and stripped.startswith(("{", "[")):
+        raise PasteError(
+            "This looks like JSON/HAR, not raw headers. Copy the request-header rows "
+            "as text from DevTools (name and value on one line, or on separate lines)."
+        )
+    if not headers:
+        raise PasteError(
+            "No headers recognized. Paste the request-header rows as text "
+            "('Name: value' or name/value on separate lines); do not paste JSON "
+            "or a fetch() call."
+        )
 
     if saw_request_line:
         if path and path.startswith(("http://", "https://")):
@@ -1657,9 +1721,26 @@ def filter_dirt_cheap(results):
     ]
 
 
-def score_results(results, weight):
-    if not results:
-        return results
+def _sort_date(result):
+    value = result.get("departure_date") or result.get("_dep_date")
+    return value if isinstance(value, str) and value else "9999-12-31"
+
+
+def _sort_duration(result):
+    value = result.get("duration_seconds")
+    return value if isinstance(value, (int, float)) else float("inf")
+
+
+def _sort_price(result):
+    value = result.get("price")
+    return value if isinstance(value, (int, float)) else float("inf")
+
+
+def _sort_direction(result):
+    return 0 if result.get("_direction") == "OB" else 1
+
+
+def _apply_balanced_scores(results):
     prices = [r["price"] or 0 for r in results]
     durations = [r["duration_seconds"] or 0 for r in results]
     max_price = max(prices) if prices else 1
@@ -1669,14 +1750,60 @@ def score_results(results, weight):
     for r in results:
         np_val = (r["price"] or 0) / max_price
         nd_val = (r["duration_seconds"] or 0) / max_dur
-        if weight == "price":
-            r["_score"] = np_val
-        elif weight == "duration":
-            r["_score"] = nd_val
-        else:
-            r["_score"] = 0.5 * np_val + 0.5 * nd_val
-    results.sort(key=lambda x: x["_score"])
+        r["_score"] = 0.5 * np_val + 0.5 * nd_val
+
+
+def sort_results(results, order="duration"):
+    if not results:
+        return results
+    if order == "balanced":
+        _apply_balanced_scores(results)
+
+    def key(r):
+        date = _sort_date(r)
+        direction = _sort_direction(r)
+        duration = _sort_duration(r)
+        price = _sort_price(r)
+        if order == "price":
+            return (date, direction, price, duration)
+        if order == "balanced":
+            return (date, direction, r.get("_score", 0), duration, price)
+        return (date, direction, duration, price)
+
+    results.sort(key=key)
     return results
+
+
+def rank_results(results, order="duration"):
+    if not results:
+        return results
+    if order == "balanced":
+        _apply_balanced_scores(results)
+
+    def key(r):
+        date = _sort_date(r)
+        direction = _sort_direction(r)
+        duration = _sort_duration(r)
+        price = _sort_price(r)
+        if order == "price":
+            return (price, duration, date, direction)
+        if order == "balanced":
+            return (r.get("_score", 0), duration, price, date, direction)
+        return (duration, price, date, direction)
+
+    results.sort(key=key)
+    return results
+
+
+def limit_scan_results(results, order="duration", top_n=5):
+    grouped = {}
+    for r in results:
+        grouped.setdefault(r.get("_direction"), []).append(r)
+    limited = []
+    for group in grouped.values():
+        rank_results(group, order)
+        limited.extend(group[:top_n])
+    return sort_results(limited, order)
 
 
 # ============================================================
@@ -2638,21 +2765,21 @@ def parse_args(argv=None):
             "  %(prog)s --scan --ob 3 --rb 2    scan both directions\n"
             "  %(prog)s --drift 3                 drift both dates by ±3 days\n"
             "  %(prog)s --drift-ret 3             drift only return date by ±3 days\n"
-            "  %(prog)s --scan --weight duration --max-price ECONOMY=8000\n"
+            "  %(prog)s --scan --sort price --max-price ECONOMY=8000\n"
             "  %(prog)s --all-fares             show BUSINESS_LITE/ELITE if dirt-cheap"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("--paste", action="store_true", help="Paste fresh browser headers and save as config")
+    p.add_argument("--paste", action="store_true", help="Paste fresh browser headers and save as config; exits unless combined with other arguments")
     p.add_argument("--json", action="store_true", help="Output raw JSON instead of table")
     p.add_argument("--scan", action="store_true", help="Enable scan mode (scan outbound by default)")
     p.add_argument("--ob", type=_non_negative_int, default=None, metavar="DAYS", help="Scan \u00b1DAYS for outbound (0 = exact date)")
     p.add_argument("--rb", type=_non_negative_int, default=None, metavar="DAYS", help="Scan \u00b1DAYS for return (0 = exact date)")
     p.add_argument("--min-trip", type=_non_negative_int, default=None, metavar="DAYS", help="Minimum trip length in days (0 allowed)")
-    p.add_argument("--weight", choices=["price", "duration", "balanced"], default=None, help="Optimization weight")
+    p.add_argument("--weight", "--sort", dest="weight", choices=["price", "duration", "balanced"], default=None, help="Sort after date: duration (default), price, or balanced; date is always primary")
     p.add_argument("--max-price", type=_parse_max_price, default=None, metavar="CABIN=VAL,...", help="e.g. ECONOMY=9000,BUSINESS=15000 (value > 0; cabin names case-insensitive)")
     p.add_argument("--max-duration", type=_positive_int, default=None, metavar="HOURS", help="Max flight duration in hours (positive)")
-    p.add_argument("--top", type=_positive_int, default=None, metavar="N", help="Show top N results (positive)")
+    p.add_argument("--top", type=_positive_int, default=None, metavar="N", help="Show top N results per scan direction (positive)")
     p.add_argument("--urls", action="store_true", help="Show booking URLs for date pairs")
     p.add_argument("--nocache", action="store_true", help="Bypass offers cache, fetch fresh data")
     p.add_argument("--nofilter", action="store_true", help="Disable max-price filtering, show all results")
@@ -2756,10 +2883,10 @@ def _scan_dates(
                 log.print("[yellow]No results passed filters (max price/duration).[/yellow]")
             final = []
         else:
-            final = score_results(filtered, weight)[:top_n]
+            final = limit_scan_results(filtered, weight, top_n)
 
     if aborted is not None:
-        log.print(f"[yellow]Scan aborted; showing {len(final)} partial result(s).[/yellow]")
+        log.print(f"[yellow]Scan aborted; {len(final)} partial offer(s) before final filtering.[/yellow]")
         raise ScanAborted(final, _abort_reason(aborted), aborted) from aborted
     return final
 
@@ -2886,7 +3013,7 @@ def drift_scan(headers, cookies, args, max_price, max_dur, stats=None):
             final = filtered
 
     if aborted is not None:
-        log.print(f"[yellow]Scan aborted; showing {len(final)} partial result(s).[/yellow]")
+        log.print(f"[yellow]Scan aborted; {len(final)} partial offer(s) before final filtering.[/yellow]")
         raise ScanAborted(final, _abort_reason(aborted), aborted) from aborted
     return final
 
@@ -2967,7 +3094,7 @@ def drift_scan_return(headers, cookies, args, max_price, max_dur, stats=None):
             final = filtered
 
     if aborted is not None:
-        log.print(f"[yellow]Scan aborted; showing {len(final)} partial result(s).[/yellow]")
+        log.print(f"[yellow]Scan aborted; {len(final)} partial offer(s) before final filtering.[/yellow]")
         raise ScanAborted(final, _abort_reason(aborted), aborted) from aborted
     return final
 
@@ -3226,14 +3353,20 @@ def print_booking_links(results, to_stderr=False):
 
 def main():
     try:
-        _main()
+        _main(sys.argv[1:])
     except LocalStateError as e:
         log.print(f"[red]{escape(str(e))}[/red]")
         sys.exit(1)
 
 
-def _main():
-    args = parse_args()
+def _paste_only(argv):
+    if argv is None:
+        return False
+    return not [arg for arg in argv if arg != "--paste"]
+
+
+def _main(argv=None):
+    args = parse_args(argv)
     SCAN["max_retries"] = max(0, min(1, args.max_retries))
     configure_rate_limiter(
         base_delay=args.delay if args.delay is not None else SCAN["delay_seconds"],
@@ -3256,6 +3389,8 @@ def _main():
     cfg = None
     if args.paste:
         cfg = prompt_paste_headers()
+        if _paste_only(argv):
+            return
 
     if args.price_map:
         print_price_map()
@@ -3372,6 +3507,7 @@ def _main():
 
     def display_outbound_partial(results):
         ob_label = f"Outbound \u2014  {SEARCH['origin']}\u2192{SEARCH['destination']}  {SEARCH['departure_date']}"
+        results = sort_results(results, weight)
         if args.json:
             print_json_combined({"outbound": merge_cabins(results), "return": []})
         else:
@@ -3486,7 +3622,7 @@ def _main():
         if all_results:
             if not args.nofilter:
                 all_results = filter_results(all_results, max_price, max_dur)
-            all_results = score_results(all_results, weight)[:top_n]
+            all_results = limit_scan_results(all_results, weight, top_n)
 
             label = (
                 f"Scan results"
@@ -3602,6 +3738,8 @@ def _main():
 
         ob_label = f"Outbound \u2014  {SEARCH['origin']}\u2192{SEARCH['destination']}  {SEARCH['departure_date']}"
         rb_label = f"Return \u2014  {SEARCH['destination']}\u2192{SEARCH['origin']}  {SEARCH['return_date']}"
+        sort_results(ob_results, weight)
+        sort_results(rb_results, weight)
         if args.json:
             combined = {"outbound": merge_cabins(ob_results), "return": merge_cabins(rb_results)}
             print_json_combined(combined)

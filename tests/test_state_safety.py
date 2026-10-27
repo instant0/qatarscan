@@ -44,18 +44,30 @@ class LayoutSafetyTests(unittest.TestCase):
                 log_print.assert_called_once()
 
     def test_valid_container_shapes_preserve_existing_values(self):
-        self._write({"aircraft": {"788": 5}, "by_flight": {"QR1": "Pod"}})
+        self._write({"aircraft": {"788": "Pod"}, "by_flight": {"QR1": "Old"}})
         with patch.object(flights.log, "print") as log_print:
             result = flights.load_layouts()
-        self.assertEqual(result["aircraft"]["788"], 5)
-        self.assertEqual(result["by_flight"]["QR1"], "Pod")
+        self.assertEqual(result["aircraft"]["788"], "Pod")
+        self.assertEqual(result["by_flight"]["QR1"], "Old")
         log_print.assert_not_called()
+
+    def test_non_string_layout_values_are_dropped_with_warning(self):
+        self._write({"aircraft": {"788": 5, "789": "Door"}, "by_flight": {"QR1": 7}})
+        with patch.object(flights.log, "print") as log_print:
+            result = flights.load_layouts()
+        self.assertEqual(result["aircraft"], {"789": "Door"})
+        self.assertEqual(result["by_flight"], {})
+        log_print.assert_called_once()
 
     def test_classify_layout_tolerates_invalid_global_shapes(self):
         flights.layouts = {"aircraft": "bad", "by_flight": []}
         self.assertEqual(flights.classify_layout("788", "QR1", False), "Unknown")
         flights.layouts = {"aircraft": {"788": 5}, "by_flight": {}}
-        self.assertEqual(flights.classify_layout("788", "QR1", False), 5)
+        self.assertEqual(flights.classify_layout("788", "QR1", False), "Unknown")
+        flights.layouts = {"aircraft": {}, "by_flight": {"QR1": 7}}
+        self.assertEqual(flights.classify_layout("788", "QR1", False), "Unknown")
+        flights.layouts = {"aircraft": {"789": "Door"}, "by_flight": {}}
+        self.assertEqual(flights.classify_layout("789", "QR1", False), "Door")
         self.assertEqual(flights.classify_layout("788", "QR1", True), "QSuite")
 
 

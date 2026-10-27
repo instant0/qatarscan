@@ -15,6 +15,7 @@ any proprietary data.
 
 1. Install dependencies: `pip install requests rich`
 2. Paste browser headers: `python flights.py --paste`
+   (saves `config.json` and exits; add search flags to run a query in the same invocation)
    (See [Obtaining request headers](#obtaining-request-headers) below.)
 3. Search a single pair: `python flights.py`
 4. Scan ±N days around both dates: `python flights.py --drift 5`
@@ -29,11 +30,14 @@ account first.
 Steps:
 
 1. Open a suitable un-authenticated flight-scans page (example below).
-2. Open Chrome devtools → **Network** tab.
+2. Open Edge/Chrome DevTools → **Network** tab.
 3. Set the filter to **XHR**.
 4. Run a flight search, then search the requests for `flight-offers`.
-5. Select the `flight-offers` request and copy its request headers as raw
-   text: the optional request line plus one `Header: value` line per header.
+5. Copy the `flight-offers` request-header rows as text and paste them.
+   Chromium/Edge may offer right-click → **Copy** → **Copy request headers**;
+   if that option is absent, select the header rows in the Headers panel and
+   copy them as text. Both `Name: value` and the two-line `name` / `value`
+   form are accepted.
 
 `--paste` accepts raw request headers, not a fetch/JSON object. The accepted
 format is:
@@ -45,6 +49,10 @@ format is:
 - Then one `Header: value` per line. A `Cookie: a=b; c=d` line is parsed into
   the scanner's cookie allowlist. Do not paste a `fetch(...)` call or a JSON
   object such as `{"headers": {...}}`; those are not parsed.
+- Edge/Chromium sometimes copies HTTP/2 pseudo-headers and the header list as
+  `name` on one line and `value` on the next (e.g. `:method` / `POST`,
+  `user-agent` / `Mozilla/...`). That two-line form is accepted too; pseudo-
+  headers are ignored except for request-line validation.
 
 For example:
 
@@ -84,9 +92,10 @@ Flags:
   --ob N                    Scan outbound ±N days (0 = exact date)
   --rb N                    Scan return ±N days (0 = exact date)
   --min-trip N              Minimum trip length in days (0 or greater; default: 8)
-  --weight {price,duration,balanced}
-                            Scan optimization weight (default: price)
-  --top N                   Top N results per scan (positive; default: 5)
+  --sort, --weight {price,duration,balanced}
+                            Sort after date; date is always primary
+                            (default: duration)
+  --top N                   Top N results per scan direction (positive; default: 5)
   --max-duration HOURS      Max flight duration in hours (positive; default: 25)
   --max-price CABIN=VAL     Price cap, e.g. ECONOMY=8000,BUSINESS=14000
                             (only ECONOMY/BUSINESS; integers > 0; case-insensitive)
@@ -97,7 +106,7 @@ Flags:
   --calendar [MONTH YEAR]   Show price calendar (e.g. "Aug 2026"; no config needed)
   --trends                  Show price trend analysis from collected data (no config needed)
   --price-map               Show day-of-week price table (no config needed)
-  --paste                   Paste new browser headers
+  --paste                   Paste new browser headers; saves config and exits unless other arguments are given
   --urls                    Show booking links (single, scan, and drift modes)
   --nocache                 Bypass offers cache
   --json                    Output raw JSON (links go to stderr with --urls)
@@ -110,6 +119,9 @@ Flags:
 ```
 
 Notes:
+  Tables are sorted by date first, then the selected secondary order (duration by
+  default, or price with `--sort price`). In both-direction scans this keeps
+  outbound results before return results regardless of price.
   Corrupt/unreadable rate-limit state fails closed. `--force` does not bypass unusable
   state; use `--clear-block` to reset it.
   `--calendar` and `--trends` can be combined: `python flights.py --trends --calendar`.
