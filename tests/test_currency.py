@@ -47,89 +47,76 @@ class CurrencyTests(unittest.TestCase):
         with open(flights.CURRENCY_FILE) as f:
             return json.load(f)
 
-    def test_invalid_prices_are_unchanged_with_one_warning(self):
-        values = [None, "5000", float("nan"), float("inf"), -1, True]
-        results = [{"price": value, "currency": "THB"} for value in values]
-        with patch.object(flights.log, "print") as log_print:
-            returned = flights.convert_prices(results)
-        self.assertIs(returned, results)
-        for row, value in zip(results, values):
-            if isinstance(value, float) and math.isnan(value):
-                self.assertTrue(math.isnan(row["price"]))
-            else:
-                self.assertEqual(row["price"], value)
-            self.assertEqual(row["currency"], "THB")
-            self.assertNotIn("_converted", row)
-        self.assertEqual(log_print.call_count, 1)
-        self.assertIn("Skipped", str(log_print.call_args))
-
-    def test_invalid_currency_is_unchanged(self):
-        results = [
-            {"price": 1000, "currency": currency}
-            for currency in (None, "", "   ", 123)
-        ]
-        with patch.object(flights.log, "print") as log_print:
-            flights.convert_prices(results)
-        for row in results:
-            self.assertEqual(row["price"], 1000)
-            self.assertNotIn("_converted", row)
-        self.assertEqual(log_print.call_count, 1)
-
-    def test_valid_conversion_rounds_and_sets_converted(self):
-        flights._currency_rates["THB_NOK"] = {
-            "rate": 0.3,
-            "date": self._today(),
-        }
-        results = [{"price": 1001, "currency": "THB"}]
-        with patch.object(flights.requests, "get") as get:
-            flights.convert_prices(results)
-        get.assert_not_called()
-        self.assertEqual(results[0]["price"], 300)
-        self.assertEqual(results[0]["currency"], "NOK")
-        self.assertTrue(results[0]["_converted"])
-
-    def test_lowercase_currency_is_normalized(self):
-        flights._currency_rates["THB_NOK"] = {
-            "rate": 0.3,
-            "date": self._today(),
-        }
-        results = [
-            {"price": 1000, "currency": "thb"},
-            {"price": 1000, "currency": "nok"},
-        ]
-        flights.convert_prices(results)
-        self.assertEqual(results[0]["price"], 300)
-        self.assertEqual(results[0]["currency"], "NOK")
-        self.assertTrue(results[0]["_converted"])
-        self.assertEqual(results[1]["price"], 1000)
-        self.assertEqual(results[1]["currency"], "NOK")
-        self.assertNotIn("_converted", results[1])
-
-    def test_warn_false_suppresses_summary(self):
-        results = [{"price": None, "currency": "THB"}]
-        with patch.object(flights.log, "print") as log_print:
-            flights.convert_prices(results, warn=False)
-        self.assertIsNone(results[0]["price"])
-        log_print.assert_not_called()
-
-    def test_valid_stale_cache_is_used_after_fx_failure(self):
-        stale_date = "2020-01-01"
-        self._write_currency(
-            {"THB_NOK": {"rate": 0.3, "date": stale_date}}
-        )
-        with patch.object(
-            flights.requests, "get", side_effect=Exception("network down")
-        ):
+    def test_invalid_prices_and_currencies_are_unchanged_with_one_warning(self):
+        with self.subTest(kind="prices"):
+            values = [None, "5000", float("nan"), float("inf"), -1, True]
+            results = [{"price": value, "currency": "THB"} for value in values]
             with patch.object(flights.log, "print") as log_print:
-                rate = flights.get_conversion_rate("THB")
-        self.assertEqual(rate, 0.3)
-        messages = " ".join(str(c) for c in log_print.call_args_list)
-        self.assertIn(stale_date, messages)
-        self.assertEqual(
-            self._read_currency()["THB_NOK"]["date"], stale_date
-        )
+                returned = flights.convert_prices(results)
+            self.assertIs(returned, results)
+            for row, value in zip(results, values):
+                if isinstance(value, float) and math.isnan(value):
+                    self.assertTrue(math.isnan(row["price"]))
+                else:
+                    self.assertEqual(row["price"], value)
+                self.assertEqual(row["currency"], "THB")
+                self.assertNotIn("_converted", row)
+            self.assertEqual(log_print.call_count, 1)
+            self.assertIn("Skipped", str(log_print.call_args))
+        with self.subTest(kind="currencies"):
+            results = [
+                {"price": 1000, "currency": currency}
+                for currency in (None, "", "   ", 123)
+            ]
+            with patch.object(flights.log, "print") as log_print:
+                flights.convert_prices(results)
+            for row in results:
+                self.assertEqual(row["price"], 1000)
+                self.assertNotIn("_converted", row)
+            self.assertEqual(log_print.call_count, 1)
+        with self.subTest(kind="warn_false"):
+            results = [{"price": None, "currency": "THB"}]
+            with patch.object(flights.log, "print") as log_print:
+                flights.convert_prices(results, warn=False)
+            self.assertIsNone(results[0]["price"])
+            log_print.assert_not_called()
 
-    def test_invalid_endpoint_rates_are_not_used_or_written(self):
+    def test_valid_conversion_and_lowercase_normalization(self):
+        flights._currency_rates["THB_NOK"] = {
+            "rate": 0.3,
+            "date": self._today(),
+        }
+        with self.subTest(kind="rounding"):
+            results = [{"price": 1001, "currency": "THB"}]
+            with patch.object(flights.requests, "get") as get:
+                flights.convert_prices(results)
+            get.assert_not_called()
+            self.assertEqual(results[0]["price"], 300)
+            self.assertEqual(results[0]["currency"], "NOK")
+            self.assertTrue(results[0]["_converted"])
+        with self.subTest(kind="lowercase"):
+            results = [
+                {"price": 1000, "currency": "thb"},
+                {"price": 1000, "currency": "nok"},
+            ]
+            flights.convert_prices(results)
+            self.assertEqual(results[0]["price"], 300)
+            self.assertEqual(results[0]["currency"], "NOK")
+            self.assertTrue(results[0]["_converted"])
+            self.assertEqual(results[1]["price"], 1000)
+            self.assertEqual(results[1]["currency"], "NOK")
+            self.assertNotIn("_converted", results[1])
+
+    def test_invalid_codes_and_endpoint_rates_are_rejected(self):
+        for code in (None, "US", "US1", "ABCD", "ÅÅÅ"):
+            with self.subTest(code=code):
+                with patch.object(flights.requests, "get") as get:
+                    with patch.object(flights.log, "print") as log_print:
+                        self.assertIsNone(
+                            flights.get_conversion_rate(code)
+                        )
+                get.assert_not_called()
+                self.assertEqual(log_print.call_count, 1)
         payloads = [
             "not-a-dict",
             {},
@@ -196,17 +183,6 @@ class CurrencyTests(unittest.TestCase):
             flights._currency_rates["THB_NOK"]["rate"], 0.3
         )
 
-    def test_invalid_currency_code_warns_and_returns_none(self):
-        for code in (None, "US", "US1", "ABCD", "ÅÅÅ"):
-            with self.subTest(code=code):
-                with patch.object(flights.requests, "get") as get:
-                    with patch.object(flights.log, "print") as log_print:
-                        self.assertIsNone(
-                            flights.get_conversion_rate(code)
-                        )
-                get.assert_not_called()
-                self.assertEqual(log_print.call_count, 1)
-
     def test_saving_rate_preserves_unrelated_currency_keys(self):
         yesterday = (
             datetime.now() - timedelta(days=1)
@@ -230,6 +206,127 @@ class CurrencyTests(unittest.TestCase):
         self.assertEqual(data["VND_NOK"], original["VND_NOK"])
         self.assertEqual(data["THB_NOK"]["rate"], 0.31)
         self.assertEqual(data["THB_NOK"]["date"], self._today())
+
+    def test_stale_fallback_is_memoized_and_reused(self):
+        stale_date = "2020-01-01"
+        self._write_currency(
+            {
+                "THB_NOK": {"rate": 0.3, "date": stale_date},
+                "USD_NOK": {"rate": 9.2, "date": stale_date},
+            }
+        )
+        with self.subTest(kind="memoized"):
+            results = [{"price": 100, "currency": "THB"} for _ in range(5)]
+            results += [{"price": 10, "currency": "USD"} for _ in range(5)]
+            with patch.object(
+                flights.requests, "get", side_effect=Exception("network down")
+            ) as get:
+                with patch.object(flights.log, "print") as log_print:
+                    flights.convert_prices(results)
+            self.assertEqual(get.call_count, 2)
+            self.assertTrue(all(row["currency"] == "NOK" for row in results))
+            messages = [str(call) for call in log_print.call_args_list]
+            thb_warnings = [
+                message
+                for message in messages
+                if "FX rate fetch failed" in message and "THB" in message
+            ]
+            usd_warnings = [
+                message
+                for message in messages
+                if "FX rate fetch failed" in message and "USD" in message
+            ]
+            self.assertEqual(len(thb_warnings), 1)
+            self.assertEqual(len(usd_warnings), 1)
+            data = self._read_currency()
+            self.assertEqual(data["THB_NOK"]["date"], stale_date)
+            self.assertEqual(data["USD_NOK"]["date"], stale_date)
+            self.assertTrue(
+                flights._currency_rates["THB_NOK"][flights._FX_FALLBACK_FAILED]
+            )
+        flights._currency_rates.clear()
+        with self.subTest(kind="warning_includes_date"):
+            with patch.object(
+                flights.requests, "get", side_effect=Exception("network down")
+            ):
+                with patch.object(flights.log, "print") as log_print:
+                    rate = flights.get_conversion_rate("THB")
+            self.assertEqual(rate, 0.3)
+            messages = " ".join(str(c) for c in log_print.call_args_list)
+            self.assertIn(stale_date, messages)
+            self.assertEqual(
+                self._read_currency()["THB_NOK"]["date"], stale_date
+            )
+
+    def test_archive_prices_reuse_stale_fx_without_network_storm(self):
+        stale_date = "2020-01-01"
+        self._write_currency(
+            {"THB_NOK": {"rate": 0.3, "date": stale_date}}
+        )
+        archive_path = os.path.join(self.tmp.name, "cache_archive.json")
+        old_archive = flights.CACHE_ARCHIVE_FILE
+        flights.CACHE_ARCHIVE_FILE = archive_path
+        self.addCleanup(setattr, flights, "CACHE_ARCHIVE_FILE", old_archive)
+
+        def offer(date_str):
+            return {
+                "duration": 36000,
+                "numberOfStops": 0,
+                "origin": {"iataCode": "OSL"},
+                "destination": {"iataCode": "BKK"},
+                "segments": [
+                    {
+                        "flightNumber": "QR1",
+                        "vehicle": {"code": "788", "name": "Boeing 787-8"},
+                        "departure": {"dateTime": f"{date_str}T10:00:00"},
+                        "arrival": {
+                            "dateTime": f"{date_str}T20:00:00",
+                            "destination": {"iataCode": "BKK"},
+                        },
+                        "duration": 36000,
+                        "qSuiteEquipped": False,
+                    }
+                ],
+                "fareOffers": [
+                    {
+                        "cabinType": "ECONOMY",
+                        "fareFamilyCode": "ECONOMY_CLASSIC",
+                        "price": {"total": 1000, "currencyCode": "THB"},
+                    }
+                ],
+            }
+
+        archive = [
+            {
+                "key": f"OSL_BKK_2026-12-{day}",
+                "entry": {
+                    "date": f"2026-12-{day}",
+                    "data": {
+                        "flightOffers": [offer(f"2026-12-{day}")]
+                    },
+                },
+            }
+            for day in (29, 30, 31)
+        ]
+        with open(archive_path, "w") as f:
+            json.dump(archive, f)
+        with patch.object(
+            flights.requests, "get", side_effect=Exception("network down")
+        ) as get:
+            with patch.object(flights.log, "print") as log_print:
+                prices = flights._load_archive_prices()
+        self.assertEqual(get.call_count, 1)
+        self.assertEqual(
+            set(prices),
+            {"2026-12-29", "2026-12-30", "2026-12-31"},
+        )
+        messages = [str(call) for call in log_print.call_args_list]
+        self.assertEqual(
+            sum("FX rate fetch failed" in message for message in messages), 1
+        )
+        self.assertEqual(
+            self._read_currency()["THB_NOK"]["date"], stale_date
+        )
 
 
 if __name__ == "__main__":

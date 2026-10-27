@@ -1,14 +1,1 @@
-{
-  "aircraft": {
-    "789": "Door",
-    "35K": "QSuite",
-    "359": "Pod",
-    "788": "Pod",
-    "388": "Pod",
-    "77W": "Old",
-    "77L": "Old",
-    "332": "Old",
-    "333": "Old"
-  },
-  "by_flight": {}
-}
+{"aircraft": {"788": 5}}

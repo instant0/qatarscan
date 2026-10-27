@@ -60,24 +60,25 @@ class NoCacheTests(unittest.TestCase):
         with open(self.cache_path) as f:
             return json.load(f)
 
-    def test_nocache_success_preserves_existing_cache(self):
-        self._seed({"OSL_BKK_2026-12-20": {"date": self.today, "data": {"old": True}}})
-        with patch.object(flights.HttpClient, "post_offers", return_value=FakeResponse()) as post:
+    def test_nocache_success_preserves_cache_and_bypasses_hits(self):
+        self._seed(
+            {
+                "OSL_BKK_2026-12-20": {"date": self.today, "data": {"old": True}},
+                "OSL_BKK_2026-12-29": {"date": self.today, "data": {"old": True}},
+            }
+        )
+        with patch.object(
+            flights.HttpClient, "post_offers", return_value=FakeResponse()
+        ) as post:
             data, status, err = flights.fetch_flights({}, {}, "OSL", "BKK", "2026-12-29")
         self.assertEqual(status, 200)
         self.assertIsNone(err)
         self.assertEqual(data, {"flightOffers": [{"origin": {"iataCode": "OSL"}}]})
+        self.assertNotEqual(data, {"old": True})
         cache = self._read()
         self.assertIn("OSL_BKK_2026-12-20", cache)
         self.assertIn("OSL_BKK_2026-12-29", cache)
         self.assertEqual(post.call_count, 1)
-
-    def test_nocache_bypasses_hit(self):
-        self._seed({"OSL_BKK_2026-12-29": {"date": self.today, "data": {"old": True}}})
-        with patch.object(flights.HttpClient, "post_offers", return_value=FakeResponse()) as post:
-            data, status, err = flights.fetch_flights({}, {}, "OSL", "BKK", "2026-12-29")
-        self.assertEqual(post.call_count, 1)
-        self.assertNotEqual(data, {"old": True})
 
     def test_cached_hit_skips_network(self):
         flights.set_nocache(False)

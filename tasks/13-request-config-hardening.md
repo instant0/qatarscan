@@ -1,7 +1,7 @@
 # T13 — Request-header, config, and cookie hardening
 
 - **Required**: Yes
-- **Status**: **Pending**
+- **Status**: **Done** (2026-10-26)
 - **Depends on**: T02, T03, T10
 - **Blocks**: T06, T14
 - **Reference**: `../task-data.md` §4 (headers), §5 (cookies), §7 (config), §8 (errors);
@@ -96,3 +96,39 @@ parsing.
 - Do not change the header allowlist semantics from T02; enforce the same policy at send time.
 - T14 owns the final README/TASK wording; this task may update behavior docs it directly
   touches.
+
+## Execution log
+
+- Added a send-time header sanitizer (`FORBIDDEN_SEND_HEADERS`, `_sanitize_headers()`) used by
+  `HttpClient.__init__()` and again in `post_offers()`. It drops `Host`, `Content-Length`,
+  `Connection`, `TE`, `Transfer-Encoding`, `Accept-Encoding`, and `Cookie` case-insensitively,
+  plus non-string/empty values, without mutating caller headers. Required auth/browser headers,
+  fresh trace headers, and caller-supplied Referer behavior are preserved.
+- `HttpClient` now seeds the session with only allowlisted cookies and merges only allowlisted
+  response `Set-Cookie` values back into the caller cookie dict; `_persist_cookies()` also
+  filters to the T02 allowlist before writing.
+- `save_config()` now uses `_locked_data()` + `_atomic_write_json()`. `_persist_cookies()` reads
+  and merges into a valid config, preserving headers, `source_endpoint`, `saved_at`, unknown
+  keys, and refreshing `last_abck_state`; missing config creates a cookie-only file. Corrupt or
+  unreadable config is quarantined, warned about, and automatic cookie persistence is skipped.
+  Explicit saves (including `--paste`) replace the quarantined config with a fresh complete
+  config. Failed cookie writes warn and leave the prior config intact.
+- `load_config()` uses the shared guarded reader (corrupt config is quarantined, then treated as
+  missing). `validate_config()` warns on invalid/unknown/stale `_abck` with a `--paste` hint and
+  persists the detected state through `_save_abck_state()`, which updates only
+  `last_abck_state` and preserves `saved_at`.
+- Bounded body handling: `_safe_body_summary()` scans at most 8192 chars, detects HTML markers
+  there, and returns at most 300 collapsed chars; `_edge_reference()` scans at most 16384 chars;
+  `RequestFailed` now retains only the bounded summary (not the full body).
+- Tests added/extended in `tests/test_paste.py` and `tests/test_http_client.py` for polluted
+  stored headers at send time, non-mutating header filtering, allowlisted cookie merging,
+  provenance (absolute URL, wrong path/host, headers-only unknown host), valid/invalid/unknown/
+  missing/stale `_abck`, state persistence with unchanged `saved_at`, preserve/merge config,
+  corrupt quarantine + skipped auto-persist, explicit `--paste` replacement, failed cookie writes,
+  missing config, cache-hit no cookie write, and large HTML/JSON summary/reference bounds. All tests use
+  temp paths/fake sessions and no network.
+- Updated `README.md` where config/header behavior is user-facing, plus `TASK.md` and
+  `task-data.md` status rows.
+- Verification: `python -m unittest discover -s tests -v` -> 175 tests OK;
+  `python -m py_compile flights.py` OK; `python flights.py --help` exits 0. No live scans or
+  network calls.

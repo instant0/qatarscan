@@ -40,30 +40,36 @@ class PersistenceTests(unittest.TestCase):
         with open(path) as f:
             return json.load(f)
 
-    def test_atomic_write_replaces_target_without_temp_file(self):
+    def _corrupt_files(self):
+        return [n for n in os.listdir(self.tmp.name) if ".corrupt-" in n]
+
+    def test_atomic_write_success_and_failure(self):
         path = os.path.join(self.tmp.name, "data.json")
         flights._atomic_write_json(path, {"a": 1})
         self.assertEqual(self._read(path), {"a": 1})
         self.assertEqual(os.listdir(self.tmp.name), ["data.json"])
-
-    def test_atomic_write_failure_leaves_original_intact(self):
-        path = os.path.join(self.tmp.name, "data.json")
-        flights._atomic_write_json(path, {"a": 1})
         with patch.object(flights.os, "replace", side_effect=OSError("boom")):
             with self.assertRaises(OSError):
                 flights._atomic_write_json(path, {"a": 2})
         self.assertEqual(self._read(path), {"a": 1})
         self.assertEqual(os.listdir(self.tmp.name), ["data.json"])
 
-    def test_corrupt_offers_cache_is_quarantined(self):
-        with open(flights.OFFERS_CACHE_FILE, "w") as f:
-            f.write("{not json")
-        with patch.object(flights.log, "print"):
-            self.assertEqual(flights.load_offers_cache(), {})
-        corrupt = [n for n in os.listdir(self.tmp.name) if ".corrupt-" in n]
-        self.assertEqual(len(corrupt), 1)
-        with open(os.path.join(self.tmp.name, corrupt[0])) as f:
-            self.assertEqual(f.read(), "{not json")
+    def test_corrupt_cache_files_are_quarantined(self):
+        for name, target, loader in (
+            ("offers", flights.OFFERS_CACHE_FILE, flights.load_offers_cache),
+            ("currency", flights.CURRENCY_FILE, flights.load_currency_rates),
+        ):
+            with self.subTest(cache=name):
+                for stale in self._corrupt_files():
+                    os.remove(os.path.join(self.tmp.name, stale))
+                with open(target, "w") as f:
+                    f.write("{not json")
+                with patch.object(flights.log, "print"):
+                    self.assertEqual(loader(), {})
+                corrupt = self._corrupt_files()
+                self.assertEqual(len(corrupt), 1)
+                with open(os.path.join(self.tmp.name, corrupt[0])) as f:
+                    self.assertEqual(f.read(), "{not json")
 
     def test_quarantine_failure_raises_local_state_error(self):
         with open(flights.OFFERS_CACHE_FILE, "w") as f:
@@ -74,24 +80,24 @@ class PersistenceTests(unittest.TestCase):
             with self.assertRaises(flights.LocalStateError):
                 flights.load_offers_cache()
 
-    def test_save_offers_cache_merges_concurrent_additions(self):
+    def test_save_offers_cache_merges_and_survives_write_failure(self):
         self._write(
             flights.OFFERS_CACHE_FILE,
             {"A": {"date": "2026-01-01", "data": {"old": True}}},
         )
-        flights.save_offers_cache({"B": {"date": "2026-01-02", "data": {"new": True}}})
+        flights.save_offers_cache(
+            {"B": {"date": "2026-01-02", "data": {"new": True}}}
+        )
         cache = self._read(flights.OFFERS_CACHE_FILE)
         self.assertIn("A", cache)
         self.assertIn("B", cache)
-
-    def test_save_offers_cache_write_failure_does_not_raise(self):
-        self._write(flights.OFFERS_CACHE_FILE, {"A": {"date": "2026-01-01"}})
+        before = self._read(flights.OFFERS_CACHE_FILE)
         with patch.object(
             flights, "_atomic_write_json", side_effect=OSError("disk full")
         ):
             with patch.object(flights.log, "print"):
-                flights.save_offers_cache({"B": {"date": "2026-01-02"}})
-        self.assertEqual(self._read(flights.OFFERS_CACHE_FILE), {"A": {"date": "2026-01-01"}})
+                flights.save_offers_cache({"C": {"date": "2026-01-03"}})
+        self.assertEqual(self._read(flights.OFFERS_CACHE_FILE), before)
 
     def _result(self, price=5000):
         return {
@@ -110,39 +116,77 @@ class PersistenceTests(unittest.TestCase):
             "price": price,
         }
 
-    def test_update_price_map_preserves_unrelated_entries(self):
+    def test_update_price_map_preserves_and_repairs(self):
         day = datetime.strptime("2026-08-17", "%Y-%m-%d").strftime("%a")
-        existing = {
-            "OSL_BKK": {
-                day: {
-                    "OLD|09:00|0|0": {
-                        "flight": "OLD",
-                        "departure": "09:00",
-                        "arrival": "19:00",
-                        "stops": 0,
-                        "transfer_minutes": 0,
-                        "direct": False,
-                        "fares": {
-                            "ECONOMY_CLASSIC": {
-                                "min": 4000,
-                                "max": 4000,
-                                "total": 4000,
-                                "samples": 1,
-                            }
-                        },
+        with self.subTest(kind="preserves-unrelated"):
+            existing = {
+                "OSL_BKK": {
+                    day: {
+                        "OLD|09:00|0|0": {
+                            "flight": "OLD",
+                            "departure": "09:00",
+                            "arrival": "19:00",
+                            "stops": 0,
+                            "transfer_minutes": 0,
+                            "direct": False,
+                            "fares": {
+                                "ECONOMY_CLASSIC": {
+                                    "min": 4000,
+                                    "max": 4000,
+                                    "total": 4000,
+                                    "samples": 1,
+                                }
+                            },
+                        }
                     }
-                }
-            },
-            "BKK_OSL": {"Fri": {}},
-        }
-        self._write(flights.PRICE_MAP_FILE, existing)
-        flights.update_price_map([self._result()])
-        data = self._read(flights.PRICE_MAP_FILE)
-        self.assertIn("OLD|09:00|0|0", data["OSL_BKK"][day])
-        self.assertIn("BKK_OSL", data)
-        new_key = "QR1|10:00|0|0"
-        self.assertIn(new_key, data["OSL_BKK"][day])
-        self.assertEqual(data["OSL_BKK"][day][new_key]["fares"]["ECONOMY_CLASSIC"]["samples"], 1)
+                },
+                "BKK_OSL": {"Fri": {}},
+            }
+            self._write(flights.PRICE_MAP_FILE, existing)
+            flights.update_price_map([self._result()])
+            data = self._read(flights.PRICE_MAP_FILE)
+            self.assertIn("OLD|09:00|0|0", data["OSL_BKK"][day])
+            self.assertIn("BKK_OSL", data)
+            new_key = "QR1|10:00|0|0"
+            self.assertIn(new_key, data["OSL_BKK"][day])
+            self.assertEqual(
+                data["OSL_BKK"][day][new_key]["fares"]["ECONOMY_CLASSIC"]["samples"],
+                1,
+            )
+        with self.subTest(kind="repairs-invalid-fare-stats"):
+            self._write(
+                flights.PRICE_MAP_FILE,
+                {
+                    "OSL_BKK": {
+                        day: {
+                            "QR1|10:00|0|0": {
+                                "flight": "QR1",
+                                "departure": "10:00",
+                                "arrival": "19:00",
+                                "stops": 0,
+                                "transfer_minutes": 0,
+                                "direct": True,
+                                "fares": {
+                                    "ECONOMY_CLASSIC": {
+                                        "min": "bad",
+                                        "max": None,
+                                        "total": [],
+                                        "samples": 0,
+                                    }
+                                },
+                            }
+                        }
+                    }
+                },
+            )
+            with patch.object(flights.log, "print"):
+                flights.update_price_map([self._result(price=5200)])
+            data = self._read(flights.PRICE_MAP_FILE)
+            fdata = data["OSL_BKK"][day]["QR1|10:00|0|0"]["fares"][
+                "ECONOMY_CLASSIC"
+            ]
+            self.assertEqual(fdata["samples"], 1)
+            self.assertEqual(fdata["min"], 5200)
 
     def test_save_currency_rates_preserves_other_currencies(self):
         self._write(
@@ -161,47 +205,62 @@ class PersistenceTests(unittest.TestCase):
         self.assertEqual(data["THB_NOK"]["rate"], 0.31)
         self.assertEqual(data["USD_NOK"]["rate"], 9.2)
 
-    def test_archive_moves_stale_entries_and_prunes(self):
+    def test_archive_moves_prunes_and_survives_write_failure(self):
         today = datetime.now().strftime("%Y-%m-%d")
         yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
         old = (datetime.now() - timedelta(days=400)).strftime("%Y-%m-%d")
-        self._write(
-            flights.OFFERS_CACHE_FILE,
-            {
-                "YDAY": {"date": yesterday, "data": {"new": True}},
-                "DUP": {"date": yesterday, "data": {"replacement": True}},
-                "OLD": {"date": old, "data": {"old": True}},
-                "TODAY": {"date": today, "data": {"fresh": True}},
-            },
-        )
-        self._write(
-            flights.CACHE_ARCHIVE_FILE,
-            [
-                {"archived_at": "ancient", "key": "DUP", "entry": {"date": yesterday, "data": {"old": True}}},
-                {"archived_at": "ancient", "key": "KEEP", "entry": {"date": yesterday, "data": {"keep": True}}},
-                {"archived_at": "ancient", "key": "TOOOLD", "entry": {"date": old, "data": {"old": True}}},
-            ],
-        )
-        self.assertEqual(flights.archive_stale_cache(), 3)
-        cache = self._read(flights.OFFERS_CACHE_FILE)
-        archive = self._read(flights.CACHE_ARCHIVE_FILE)
-        self.assertEqual(set(cache), {"TODAY"})
-        self.assertEqual(set(a["key"] for a in archive), {"YDAY", "DUP", "KEEP"})
-        dup = [a for a in archive if a["key"] == "DUP"]
-        self.assertEqual(len(dup), 1)
-        self.assertEqual(dup[0]["entry"]["data"], {"replacement": True})
-
-    def test_archive_write_failure_keeps_stale_entries(self):
-        yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
-        cache = {"YDAY": {"date": yesterday, "data": {"new": True}}}
-        self._write(flights.OFFERS_CACHE_FILE, cache)
-        with patch.object(
-            flights, "_atomic_write_json", side_effect=OSError("disk full")
-        ):
-            with patch.object(flights.log, "print"):
-                self.assertEqual(flights.archive_stale_cache(), 0)
-        self.assertEqual(self._read(flights.OFFERS_CACHE_FILE), cache)
-        self.assertFalse(os.path.exists(flights.CACHE_ARCHIVE_FILE))
+        with self.subTest(kind="moves-and-prunes"):
+            self._write(
+                flights.OFFERS_CACHE_FILE,
+                {
+                    "YDAY": {"date": yesterday, "data": {"new": True}},
+                    "DUP": {"date": yesterday, "data": {"replacement": True}},
+                    "OLD": {"date": old, "data": {"old": True}},
+                    "TODAY": {"date": today, "data": {"fresh": True}},
+                },
+            )
+            self._write(
+                flights.CACHE_ARCHIVE_FILE,
+                [
+                    {
+                        "archived_at": "ancient",
+                        "key": "DUP",
+                        "entry": {"date": yesterday, "data": {"old": True}},
+                    },
+                    {
+                        "archived_at": "ancient",
+                        "key": "KEEP",
+                        "entry": {"date": yesterday, "data": {"keep": True}},
+                    },
+                    {
+                        "archived_at": "ancient",
+                        "key": "TOOOLD",
+                        "entry": {"date": old, "data": {"old": True}},
+                    },
+                ],
+            )
+            self.assertEqual(flights.archive_stale_cache(), 3)
+            cache = self._read(flights.OFFERS_CACHE_FILE)
+            archive = self._read(flights.CACHE_ARCHIVE_FILE)
+            self.assertEqual(set(cache), {"TODAY"})
+            self.assertEqual(
+                set(a["key"] for a in archive), {"YDAY", "DUP", "KEEP"}
+            )
+            dup = [a for a in archive if a["key"] == "DUP"]
+            self.assertEqual(len(dup), 1)
+            self.assertEqual(dup[0]["entry"]["data"], {"replacement": True})
+        with self.subTest(kind="write-failure"):
+            if os.path.exists(flights.CACHE_ARCHIVE_FILE):
+                os.remove(flights.CACHE_ARCHIVE_FILE)
+            cache = {"YDAY": {"date": yesterday, "data": {"new": True}}}
+            self._write(flights.OFFERS_CACHE_FILE, cache)
+            with patch.object(
+                flights, "_atomic_write_json", side_effect=OSError("disk full")
+            ):
+                with patch.object(flights.log, "print"):
+                    self.assertEqual(flights.archive_stale_cache(), 0)
+            self.assertEqual(self._read(flights.OFFERS_CACHE_FILE), cache)
+            self.assertFalse(os.path.exists(flights.CACHE_ARCHIVE_FILE))
 
     def test_corrupt_price_map_is_quarantined_on_update(self):
         with open(flights.PRICE_MAP_FILE, "w") as f:
@@ -210,16 +269,7 @@ class PersistenceTests(unittest.TestCase):
             flights.update_price_map([self._result()])
         self.assertTrue(os.path.exists(flights.PRICE_MAP_FILE))
         self.assertIn("OSL_BKK", self._read(flights.PRICE_MAP_FILE))
-        corrupt = [n for n in os.listdir(self.tmp.name) if ".corrupt-" in n]
-        self.assertEqual(len(corrupt), 1)
-
-    def test_corrupt_currency_cache_is_quarantined(self):
-        with open(flights.CURRENCY_FILE, "w") as f:
-            f.write("{not json")
-        with patch.object(flights.log, "print"):
-            self.assertEqual(flights.load_currency_rates(), {})
-        corrupt = [n for n in os.listdir(self.tmp.name) if ".corrupt-" in n]
-        self.assertEqual(len(corrupt), 1)
+        self.assertEqual(len(self._corrupt_files()), 1)
 
     def test_main_exits_on_local_state_error(self):
         with patch.object(flights, "_main", side_effect=flights.LocalStateError("bad")):
@@ -228,17 +278,97 @@ class PersistenceTests(unittest.TestCase):
                     flights.main()
         self.assertEqual(ctx.exception.code, 1)
 
-    def test_corrupt_price_map_and_archive_views_do_not_raise(self):
-        with open(flights.PRICE_MAP_FILE, "w") as f:
-            f.write("{not json")
-        with open(flights.CACHE_ARCHIVE_FILE, "w") as f:
-            f.write("not json")
+    def test_corrupt_and_wrong_shape_views_do_not_raise(self):
+        with self.subTest(kind="corrupt-files"):
+            with open(flights.PRICE_MAP_FILE, "w") as f:
+                f.write("{not json")
+            with open(flights.CACHE_ARCHIVE_FILE, "w") as f:
+                f.write("not json")
+            with patch.object(flights.log, "print"):
+                with patch.object(flights.console, "print"):
+                    flights.print_price_map()
+                    flights.print_price_calendar(
+                        2026, 8, "OSL", "BKK", archive_prices={}
+                    )
+                    flights.print_price_trends(
+                        "OSL", "BKK", archive_prices={}
+                    )
+                    self.assertEqual(flights._load_archive_prices(), {})
+        with self.subTest(kind="wrong-shape"):
+            self._write(
+                flights.PRICE_MAP_FILE,
+                {
+                    "BROKEN": {"Mon": {}},
+                    "OSL_BKK": {
+                        "Mon": {
+                            "QR1|10:00|0|0": {
+                                "flight": "QR1",
+                                "departure": 10,
+                                "arrival": None,
+                                "stops": "bad",
+                                "transfer_minutes": None,
+                                "fares": {
+                                    "ECONOMY_CLASSIC": {
+                                        "min": 5000,
+                                        "max": 5000,
+                                        "total": 5000,
+                                        "samples": 1,
+                                    },
+                                    "BROKEN": {"min": "bad"},
+                                },
+                            }
+                        }
+                    },
+                },
+            )
+            archive_prices = {
+                "not-a-date": {"OSL_BKK": {"ECONOMY_CLASSIC": 4000}},
+                "2026-08-17": "not-a-direction",
+                "2026-08-18": {"OSL_BKK": {"ECONOMY_CLASSIC": "bad"}},
+            }
+            with patch.object(flights.log, "print"):
+                with patch.object(flights.console, "print") as console_print:
+                    flights.print_price_map()
+                    flights.print_price_calendar(
+                        2026, 8, "OSL", "BKK", archive_prices=archive_prices
+                    )
+                    flights.print_price_trends(
+                        "OSL", "BKK", archive_prices=archive_prices
+                    )
+            text = " ".join(str(call) for call in console_print.call_args_list)
+            self.assertIn("OSL", text)
+            self.assertNotIn("BROKEN", text)
+
+    def test_wrong_shape_offers_cache_is_quarantined_once(self):
+        self._write(
+            flights.OFFERS_CACHE_FILE,
+            {"OSL_BKK_2026-12-29": "not-an-entry"},
+        )
         with patch.object(flights.log, "print"):
-            with patch.object(flights.console, "print"):
-                flights.print_price_map()
-                flights.print_price_calendar(2026, 8, "OSL", "BKK", archive_prices={})
-                flights.print_price_trends("OSL", "BKK", archive_prices={})
-                self.assertEqual(flights._load_archive_prices(), {})
+            self.assertEqual(flights.load_offers_cache(), {})
+        self.assertEqual(len(self._corrupt_files()), 1)
+        with patch.object(flights.log, "print"):
+            flights.save_offers_cache(
+                {"NEW": {"date": "2026-12-29", "data": {"ok": True}}}
+            )
+        self.assertEqual(len(self._corrupt_files()), 1)
+        self.assertEqual(
+            set(self._read(flights.OFFERS_CACHE_FILE)), {"NEW"}
+        )
+
+    def test_wrong_shape_currency_cache_is_quarantined(self):
+        self._write(flights.CURRENCY_FILE, {"THB_NOK": "not-an-entry"})
+        with patch.object(flights.log, "print"):
+            self.assertEqual(flights.load_currency_rates(), {})
+        self.assertEqual(len(self._corrupt_files()), 1)
+        flights._currency_rates.clear()
+        self.addCleanup(flights._currency_rates.clear)
+        with patch.object(
+            flights.requests, "get", side_effect=Exception("network down")
+        ):
+            with patch.object(flights.log, "print"):
+                self.assertIsNone(flights.get_conversion_rate("THB"))
+        self.assertEqual(len(self._corrupt_files()), 1)
 
 
 if __name__ == "__main__":

@@ -39,6 +39,22 @@ class FakeSession:
         return self.response
 
 
+class FakeSequenceSession:
+    def __init__(self, responses):
+        self.cookies = FakeCookieJar()
+        self.responses = list(responses)
+        self.post_calls = 0
+
+    def post(self, url, headers=None, json=None, timeout=None):
+        self.post_calls += 1
+        if not self.responses:
+            raise AssertionError("unexpected extra POST")
+        item = self.responses.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+
 class FakeLimiter:
     def __init__(self):
         self.wait = MagicMock()
@@ -74,51 +90,56 @@ class ScanFunctionAbortTests(unittest.TestCase):
     def tearDown(self):
         flights.SCAN["max_retries"] = self.old_max_retries
 
-    def test_scan_dates_edge_on_third_call_finalizes_once(self):
+    def test_scans_finalize_once_when_edge_on_third_call(self):
         edge = flights.EdgeBlock("block", status=403, reference="18.abc.123")
-        fake_fetch, state = make_abort_scan(2, edge)
-        args = make_args(ob=2, rb=None, min_trip=0, nofilter=True)
-        with patch.object(flights, "_fetch_and_parse", side_effect=fake_fetch):
-            with patch.object(flights, "update_price_map") as update:
-                with self.assertRaises(flights.ScanAborted) as ctx:
-                    flights._scan_dates(
-                        {}, {}, args, {}, "price", 25, 5, True, "OB"
-                    )
-        aborted = ctx.exception
-        self.assertEqual(state["count"], 3)
-        self.assertEqual(aborted.reason, "edge")
-        self.assertEqual(aborted.results, [{"marker": 1}, {"marker": 2}])
-        update.assert_called_once_with([{"marker": 1}, {"marker": 2}])
+        cases = [
+            (
+                "scan_dates",
+                lambda: flights._scan_dates(
+                    {},
+                    {},
+                    make_args(ob=2, rb=None, min_trip=0, nofilter=True),
+                    {},
+                    "price",
+                    25,
+                    5,
+                    True,
+                    "OB",
+                ),
+            ),
+            (
+                "drift_scan",
+                lambda: flights.drift_scan(
+                    {}, {}, make_args(drift=1, nofilter=True), {}, 25
+                ),
+            ),
+            (
+                "drift_scan_return",
+                lambda: flights.drift_scan_return(
+                    {},
+                    {},
+                    make_args(drift_ret=1, min_trip=0, nofilter=True),
+                    {},
+                    25,
+                ),
+            ),
+        ]
+        for name, run_scan in cases:
+            with self.subTest(scan=name):
+                fake_fetch, state = make_abort_scan(2, edge)
+                with patch.object(
+                    flights, "_fetch_and_parse", side_effect=fake_fetch
+                ):
+                    with patch.object(flights, "update_price_map") as update:
+                        with self.assertRaises(flights.ScanAborted) as ctx:
+                            run_scan()
+                aborted = ctx.exception
+                self.assertEqual(state["count"], 3)
+                self.assertEqual(aborted.reason, "edge")
+                self.assertEqual(aborted.results, [{"marker": 1}, {"marker": 2}])
+                update.assert_called_once_with([{"marker": 1}, {"marker": 2}])
 
-    def test_drift_scan_edge_on_third_call_finalizes_once(self):
-        edge = flights.EdgeBlock("block", status=403, reference="18.abc.123")
-        fake_fetch, state = make_abort_scan(2, edge)
-        args = make_args(drift=1, nofilter=True)
-        with patch.object(flights, "_fetch_and_parse", side_effect=fake_fetch):
-            with patch.object(flights, "update_price_map") as update:
-                with self.assertRaises(flights.ScanAborted) as ctx:
-                    flights.drift_scan({}, {}, args, {}, 25)
-        aborted = ctx.exception
-        self.assertEqual(state["count"], 3)
-        self.assertEqual(aborted.reason, "edge")
-        self.assertEqual(aborted.results, [{"marker": 1}, {"marker": 2}])
-        update.assert_called_once_with([{"marker": 1}, {"marker": 2}])
-
-    def test_drift_scan_return_edge_on_third_call_finalizes_once(self):
-        edge = flights.EdgeBlock("block", status=403, reference="18.abc.123")
-        fake_fetch, state = make_abort_scan(2, edge)
-        args = make_args(drift_ret=1, min_trip=0, nofilter=True)
-        with patch.object(flights, "_fetch_and_parse", side_effect=fake_fetch):
-            with patch.object(flights, "update_price_map") as update:
-                with self.assertRaises(flights.ScanAborted) as ctx:
-                    flights.drift_scan_return({}, {}, args, {}, 25)
-        aborted = ctx.exception
-        self.assertEqual(state["count"], 3)
-        self.assertEqual(aborted.reason, "edge")
-        self.assertEqual(aborted.results, [{"marker": 1}, {"marker": 2}])
-        update.assert_called_once_with([{"marker": 1}, {"marker": 2}])
-
-    def test_scan_dates_reason_for_each_typed_error(self):
+    def test_abort_reason_and_cooldown_recording(self):
         cases = [
             (flights.AppAuthError("auth"), "auth"),
             (flights.RateLimited(120, "2026-10-26T12:00:00+00:00"), "rate"),
@@ -138,15 +159,14 @@ class ScanFunctionAbortTests(unittest.TestCase):
                 self.assertEqual(ctx.exception.reason, expected)
                 self.assertEqual(len(ctx.exception.results), 2)
 
-    def test_record_block_only_for_edge(self):
-        cases = [
-            (flights.EdgeBlock("block"), "edge", True),
-            (flights.AppAuthError("auth"), "auth", False),
-            (flights.RateLimited(60, "2026-10-26T12:00:00+00:00"), "rate", False),
-            (flights.BudgetExceeded(1), "budget", False),
+        block_cases = [
+            (flights.EdgeBlock("block"), True),
+            (flights.AppAuthError("auth"), False),
+            (flights.RateLimited(60, "2026-10-26T12:00:00+00:00"), False),
+            (flights.BudgetExceeded(1), False),
         ]
-        for exc, reason, expected in cases:
-            with self.subTest(reason=reason):
+        for exc, expected in block_cases:
+            with self.subTest(block=type(exc).__name__):
                 limiter = FakeLimiter()
                 aborted = flights.ScanAborted([], flights._abort_reason(exc), exc)
                 with patch.object(flights, "get_rate_limiter", return_value=limiter):
@@ -160,41 +180,67 @@ class ScanFunctionAbortTests(unittest.TestCase):
 
 
 class AbortMessageTests(unittest.TestCase):
-    def test_edge_with_reference(self):
-        cause = flights.EdgeBlock("block", status=403, reference="18.abc.123")
-        message = flights._abort_message(flights.ScanAborted([], "edge", cause))
-        self.assertIn("Akamai edge", message)
-        self.assertIn("18.abc.123", message)
-        self.assertIn("--paste", message)
+    def test_edge_message_variants(self):
+        for reference, expected, absent in (
+            ("18.abc.123", ("Akamai edge", "18.abc.123", "--paste"), ()),
+            (None, ("Akamai edge", "--paste"), ("None",)),
+        ):
+            with self.subTest(reference=reference):
+                cause = flights.EdgeBlock("block", status=403, reference=reference)
+                message = flights._abort_message(flights.ScanAborted([], "edge", cause))
+                for text in expected:
+                    self.assertIn(text, message)
+                for text in absent:
+                    self.assertNotIn(text, message)
 
-    def test_edge_without_reference(self):
-        cause = flights.EdgeBlock("block", status=403)
-        message = flights._abort_message(flights.ScanAborted([], "edge", cause))
-        self.assertNotIn("None", message)
+    def test_non_edge_messages(self):
+        cases = [
+            (
+                "auth",
+                flights.ScanAborted([], "auth", flights.AppAuthError("bad")),
+                ("Session rejected", "--paste"),
+                (),
+            ),
+            (
+                "rate_remaining",
+                flights.ScanAborted(
+                    [],
+                    "rate",
+                    flights.RateLimited(125, "2026-10-26T12:10:00+00:00"),
+                ),
+                ("about 3 min remaining", "--force", "--clear-block"),
+                (),
+            ),
+            (
+                "rate_state_error",
+                flights.ScanAborted(
+                    [],
+                    "rate",
+                    flights.RateLimited(
+                        1200, "2026-10-26T12:20:00+00:00", state_error=True
+                    ),
+                ),
+                ("corrupt", "--clear-block"),
+                ("--force",),
+            ),
+            (
+                "budget",
+                flights.ScanAborted([], "budget", flights.BudgetExceeded(7)),
+                ("(7 calls)", "--budget"),
+                (),
+            ),
+        ]
+        for name, aborted, expected, absent in cases:
+            with self.subTest(case=name):
+                message = flights._abort_message(aborted)
+                for text in expected:
+                    self.assertIn(text, message)
+                for text in absent:
+                    self.assertNotIn(text, message)
 
-    def test_auth(self):
-        message = flights._abort_message(
-            flights.ScanAborted([], "auth", flights.AppAuthError("bad"))
-        )
-        self.assertIn("Session rejected", message)
-        self.assertIn("--paste", message)
-
-    def test_rate_remaining_minutes(self):
-        cause = flights.RateLimited(125, "2026-10-26T12:10:00+00:00")
-        message = flights._abort_message(flights.ScanAborted([], "rate", cause))
-        self.assertIn("about 3 min remaining", message)
-        self.assertIn("--force", message)
-        self.assertIn("--clear-block", message)
-
-    def test_budget_count(self):
-        cause = flights.BudgetExceeded(7)
-        message = flights._abort_message(flights.ScanAborted([], "budget", cause))
-        self.assertIn("(7 calls)", message)
-        self.assertIn("--budget", message)
-
-    def test_fallback(self):
-        message = flights._abort_message(flights.ScanAborted([], "unknown"))
-        self.assertEqual(message, "Scan aborted.")
+        with self.subTest(case="fallback"):
+            message = flights._abort_message(flights.ScanAborted([], "unknown"))
+            self.assertEqual(message, "Scan aborted.")
 
 
 class RetryTests(unittest.TestCase):
@@ -204,25 +250,47 @@ class RetryTests(unittest.TestCase):
     def tearDown(self):
         flights.SCAN["max_retries"] = self.old_max_retries
 
-    def test_transient_500_retried_then_succeeds(self):
-        flights.SCAN["max_retries"] = 1
-        with patch.object(
-            flights,
-            "fetch_flights",
-            side_effect=[flights.RequestFailed(500, "boom"), ("data", 200, None)],
-        ) as fetch:
-            result = flights._fetch_with_retries({}, {}, "OSL", "BKK", "2026-12-29")
-        self.assertEqual(result, ("data", 200, None))
-        self.assertEqual(fetch.call_count, 2)
-
-    def test_transient_500_not_retried_by_default(self):
-        flights.SCAN["max_retries"] = 0
-        with patch.object(
-            flights, "fetch_flights", side_effect=flights.RequestFailed(500, "boom")
-        ) as fetch:
-            with self.assertRaises(flights.RequestFailed):
-                flights._fetch_with_retries({}, {}, "OSL", "BKK", "2026-12-29")
-        self.assertEqual(fetch.call_count, 1)
+    def test_retry_policy_for_transient_and_non_retryable_errors(self):
+        cases = [
+            (
+                "transient_retried",
+                1,
+                [flights.RequestFailed(500, "boom"), ("data", 200, None)],
+                ("data", 200, None),
+                2,
+            ),
+            (
+                "default_no_retry",
+                0,
+                flights.RequestFailed(500, "boom"),
+                flights.RequestFailed,
+                1,
+            ),
+            (
+                "non_retryable_4xx",
+                1,
+                flights.RequestFailed(404, "nope"),
+                flights.RequestFailed,
+                1,
+            ),
+        ]
+        for name, max_retries, side_effect, expected, calls in cases:
+            with self.subTest(case=name):
+                flights.SCAN["max_retries"] = max_retries
+                with patch.object(
+                    flights, "fetch_flights", side_effect=side_effect
+                ) as fetch:
+                    if isinstance(expected, type) and issubclass(expected, Exception):
+                        with self.assertRaises(expected):
+                            flights._fetch_with_retries(
+                                {}, {}, "OSL", "BKK", "2026-12-29"
+                            )
+                    else:
+                        result = flights._fetch_with_retries(
+                            {}, {}, "OSL", "BKK", "2026-12-29"
+                        )
+                        self.assertEqual(result, expected)
+                self.assertEqual(fetch.call_count, calls)
 
     def test_hard_errors_never_retried(self):
         cases = [
@@ -239,39 +307,31 @@ class RetryTests(unittest.TestCase):
                         flights._fetch_with_retries({}, {}, "OSL", "BKK", "2026-12-29")
                 self.assertEqual(fetch.call_count, 1)
 
-    def test_non_retryable_4xx_not_retried(self):
-        flights.SCAN["max_retries"] = 1
-        with patch.object(
-            flights, "fetch_flights", side_effect=flights.RequestFailed(404, "nope")
-        ) as fetch:
-            with self.assertRaises(flights.RequestFailed):
-                flights._fetch_with_retries({}, {}, "OSL", "BKK", "2026-12-29")
-        self.assertEqual(fetch.call_count, 1)
+    def test_fetch_and_parse_error_handling(self):
+        with self.subTest(case="transient_failure_keeps_scan_going"):
+            flights.SCAN["max_retries"] = 0
+            with patch.object(
+                flights,
+                "_fetch_with_retries",
+                side_effect=flights.RequestFailed(500, "boom"),
+            ):
+                with patch.object(flights, "log") as log:
+                    results = flights._fetch_and_parse(
+                        {}, {}, "OSL", "BKK", "2026-12-29",
+                        "2026-12-29", "2027-01-15", "OB", 25,
+                    )
+            self.assertEqual(results, [])
+            log.print.assert_called()
 
-    def test_transient_failure_keeps_scan_going(self):
-        flights.SCAN["max_retries"] = 0
-        with patch.object(
-            flights,
-            "_fetch_with_retries",
-            side_effect=flights.RequestFailed(500, "boom"),
-        ):
-            with patch.object(flights, "log") as log:
-                results = flights._fetch_and_parse(
-                    {}, {}, "OSL", "BKK", "2026-12-29",
-                    "2026-12-29", "2027-01-15", "OB", 25,
-                )
-        self.assertEqual(results, [])
-        log.print.assert_called()
-
-    def test_edge_propagates_from_fetch_and_parse(self):
-        flights.SCAN["max_retries"] = 1
-        edge = flights.EdgeBlock("block", status=403)
-        with patch.object(flights, "_fetch_with_retries", side_effect=edge):
-            with self.assertRaises(flights.EdgeBlock):
-                flights._fetch_and_parse(
-                    {}, {}, "OSL", "BKK", "2026-12-29",
-                    "2026-12-29", "2027-01-15", "OB", 25,
-                )
+        with self.subTest(case="edge_propagates"):
+            flights.SCAN["max_retries"] = 1
+            edge = flights.EdgeBlock("block", status=403)
+            with patch.object(flights, "_fetch_with_retries", side_effect=edge):
+                with self.assertRaises(flights.EdgeBlock):
+                    flights._fetch_and_parse(
+                        {}, {}, "OSL", "BKK", "2026-12-29",
+                        "2026-12-29", "2027-01-15", "OB", 25,
+                    )
 
 
 class FetchFlightsHardeningTests(unittest.TestCase):
@@ -304,7 +364,7 @@ class FetchFlightsHardeningTests(unittest.TestCase):
         self.limiter.record_call.assert_called_once()
         self.persist.assert_not_called()
 
-    def test_edge_html_extracts_reference_without_body(self):
+    def test_html_error_summaries_are_sanitized(self):
         body = (
             "<html><title>Access Denied</title>"
             "Reference #18.abc.123 errors.edgesuite.net</html>"
@@ -329,7 +389,6 @@ class FetchFlightsHardeningTests(unittest.TestCase):
         self.assertNotIn("<html", logged)
         self.assertIn("18.abc.123", logged)
 
-    def test_html_request_failed_summary_is_omitted(self):
         failed = flights.RequestFailed(403, "<html>Access Denied</html>")
         self.assertEqual(failed.body_summary, "HTML response body (omitted)")
         with patch.object(flights.log, "print") as log_print:
@@ -354,6 +413,100 @@ class FetchFlightsHardeningTests(unittest.TestCase):
         self.limiter.wait.assert_not_called()
         self.limiter.record_call.assert_not_called()
         self.assertEqual(data, {"cached": True})
+
+
+class RetryLimiterAccountingTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.old_cache_file = flights.OFFERS_CACHE_FILE
+        self.old_lock_file = flights.DATA_LOCK_FILE
+        self.old_max_retries = flights.SCAN["max_retries"]
+        flights.OFFERS_CACHE_FILE = os.path.join(self.tmp.name, "offers_cache.json")
+        flights.DATA_LOCK_FILE = os.path.join(self.tmp.name, ".data_state.lock")
+        self.addCleanup(setattr, flights, "OFFERS_CACHE_FILE", self.old_cache_file)
+        self.addCleanup(setattr, flights, "DATA_LOCK_FILE", self.old_lock_file)
+        self.addCleanup(
+            lambda: flights.SCAN.__setitem__("max_retries", self.old_max_retries)
+        )
+        flights.set_nocache(False)
+        self.addCleanup(flights.set_nocache, False)
+        persist_patcher = patch.object(flights, "_persist_cookies")
+        persist_patcher.start()
+        self.addCleanup(persist_patcher.stop)
+
+    def _run(self, session, limiter):
+        with patch.object(flights.requests, "Session", return_value=session):
+            with patch.object(flights, "get_rate_limiter", return_value=limiter):
+                return flights._fetch_with_retries(
+                    {}, {}, "OSL", "BKK", "2026-12-29"
+                )
+
+    def test_retry_limiter_accounting(self):
+        with self.subTest(case="transient_retry"):
+            flights.SCAN["max_retries"] = 1
+            limiter = FakeLimiter()
+            session = FakeSequenceSession(
+                [
+                    FakeResponse(500, "boom"),
+                    FakeResponse(200, '{"flightOffers": []}'),
+                ]
+            )
+            result = self._run(session, limiter)
+            self.assertEqual(result, ({"flightOffers": []}, 200, None))
+            self.assertEqual(session.post_calls, 2)
+            self.assertEqual(limiter.wait.call_count, 2)
+            self.assertEqual(limiter.record_call.call_count, 2)
+            limiter.record_block.assert_not_called()
+
+        response_cases = [
+            (
+                "edge",
+                FakeResponse(
+                    403,
+                    "<html>Access Denied Reference #18.abc.123 "
+                    "errors.edgesuite.net</html>",
+                ),
+                flights.EdgeBlock,
+            ),
+            (
+                "auth",
+                FakeResponse(403, '{"error":"session"}'),
+                flights.AppAuthError,
+            ),
+        ]
+        for name, response, error in response_cases:
+            with self.subTest(case=name):
+                if os.path.exists(flights.OFFERS_CACHE_FILE):
+                    os.remove(flights.OFFERS_CACHE_FILE)
+                flights.SCAN["max_retries"] = 1
+                limiter = FakeLimiter()
+                session = FakeSequenceSession([response])
+                with self.assertRaises(error):
+                    self._run(session, limiter)
+                self.assertEqual(session.post_calls, 1)
+                self.assertEqual(limiter.wait.call_count, 1)
+                self.assertEqual(limiter.record_call.call_count, 1)
+                limiter.record_block.assert_not_called()
+
+        limiter_cases = [
+            ("rate", flights.RateLimited(60, "2026-10-26T12:00:00+00:00")),
+            ("budget", flights.BudgetExceeded(1)),
+        ]
+        for name, error in limiter_cases:
+            with self.subTest(case=name):
+                if os.path.exists(flights.OFFERS_CACHE_FILE):
+                    os.remove(flights.OFFERS_CACHE_FILE)
+                flights.SCAN["max_retries"] = 1
+                limiter = FakeLimiter()
+                limiter.wait.side_effect = error
+                session = FakeSequenceSession([])
+                with self.assertRaises(type(error)):
+                    self._run(session, limiter)
+                self.assertEqual(session.post_calls, 0)
+                self.assertEqual(limiter.wait.call_count, 1)
+                limiter.record_call.assert_not_called()
+                limiter.record_block.assert_not_called()
 
 
 class MainAbortTests(unittest.TestCase):
@@ -478,74 +631,6 @@ class MainAbortTests(unittest.TestCase):
         scan_return.assert_not_called()
         limiter.record_block.assert_called_once_with(flights.SCAN["block_minutes"])
 
-    def test_non_scan_return_edge_renders_outbound_partial(self):
-        limiter = FakeLimiter()
-        args = make_args()
-        ob_result = {"marker": "outbound"}
-        with patch.object(flights, "parse_args", return_value=args):
-            with patch.object(
-                flights, "configure_rate_limiter", return_value=limiter
-            ):
-                with patch.object(flights, "get_rate_limiter", return_value=limiter):
-                    with patch.object(
-                        flights,
-                        "load_config",
-                        return_value={"headers": {}, "cookies": {}},
-                    ):
-                        with patch.object(flights, "validate_config", return_value=True):
-                            with patch.object(
-                                flights, "archive_stale_cache", return_value=0
-                            ):
-                                with patch.object(
-                                    flights,
-                                    "_fetch_with_retries",
-                                    side_effect=[
-                                        ("ob", 200, None),
-                                        flights.EdgeBlock("block", 403, "18.abc.123"),
-                                    ],
-                                ):
-                                    with patch.object(
-                                        flights, "parse_results", return_value=[ob_result]
-                                    ):
-                                        with patch.object(
-                                            flights,
-                                            "filter_dirt_cheap",
-                                            side_effect=lambda r: r,
-                                        ):
-                                            with patch.object(
-                                                flights,
-                                                "filter_results",
-                                                side_effect=lambda r, *a: r,
-                                            ):
-                                                with patch.object(
-                                                    flights, "update_price_map"
-                                                ) as update:
-                                                    with patch.object(
-                                                        flights,
-                                                        "merge_cabins",
-                                                        side_effect=lambda r: r,
-                                                    ):
-                                                        with patch.object(
-                                                            flights,
-                                                            "print_compare_table",
-                                                        ) as table:
-                                                            with patch.object(
-                                                                flights,
-                                                                "print_booking_links",
-                                                            ):
-                                                                with patch.object(
-                                                                    flights,
-                                                                    "_log_error",
-                                                                ):
-                                                                    with self.assertRaises(
-                                                                        SystemExit
-                                                                    ) as ctx:
-                                                                        flights.main()
-        self.assertEqual(ctx.exception.code, 1)
-        update.assert_called_once_with([ob_result])
-        table.assert_called_once()
-        limiter.record_block.assert_called_once_with(flights.SCAN["block_minutes"])
-
     def test_non_scan_outbound_request_failed_exits_without_cooldown(self):
         limiter = FakeLimiter()
         args = make_args()
@@ -587,89 +672,106 @@ class MainAbortTests(unittest.TestCase):
         update.assert_not_called()
         self.assertIn("boom", str(log_error.call_args[0][0]))
 
-    def test_non_scan_return_request_failed_renders_outbound_partial(self):
-        limiter = FakeLimiter()
-        args = make_args()
-        ob_result = {"marker": "outbound"}
-        with patch.object(flights, "parse_args", return_value=args):
-            with patch.object(
-                flights, "configure_rate_limiter", return_value=limiter
-            ):
-                with patch.object(flights, "get_rate_limiter", return_value=limiter):
+    def test_non_scan_return_failures_render_outbound_partial(self):
+        cases = [
+            ("edge", flights.EdgeBlock("block", 403, "18.abc.123"), True),
+            ("request_failed", flights.RequestFailed(0, "timed out"), False),
+        ]
+        for name, failure, records_block in cases:
+            with self.subTest(case=name):
+                limiter = FakeLimiter()
+                args = make_args()
+                ob_result = {"marker": "outbound"}
+                with patch.object(flights, "parse_args", return_value=args):
                     with patch.object(
-                        flights,
-                        "load_config",
-                        return_value={"headers": {}, "cookies": {}},
+                        flights, "configure_rate_limiter", return_value=limiter
                     ):
-                        with patch.object(flights, "validate_config", return_value=True):
+                        with patch.object(
+                            flights, "get_rate_limiter", return_value=limiter
+                        ):
                             with patch.object(
-                                flights, "archive_stale_cache", return_value=0
+                                flights,
+                                "load_config",
+                                return_value={"headers": {}, "cookies": {}},
                             ):
                                 with patch.object(
-                                    flights,
-                                    "_fetch_with_retries",
-                                    side_effect=[
-                                        ("ob", 200, None),
-                                        flights.RequestFailed(0, "timed out"),
-                                    ],
+                                    flights, "validate_config", return_value=True
                                 ):
                                     with patch.object(
-                                        flights, "parse_results", return_value=[ob_result]
+                                        flights, "archive_stale_cache", return_value=0
                                     ):
                                         with patch.object(
                                             flights,
-                                            "filter_dirt_cheap",
-                                            side_effect=lambda r: r,
+                                            "_fetch_with_retries",
+                                            side_effect=[
+                                                ("ob", 200, None),
+                                                failure,
+                                            ],
                                         ):
                                             with patch.object(
                                                 flights,
-                                                "filter_results",
-                                                side_effect=lambda r, *a: r,
+                                                "parse_results",
+                                                return_value=[ob_result],
                                             ):
                                                 with patch.object(
-                                                    flights, "merge_cabins",
+                                                    flights,
+                                                    "filter_dirt_cheap",
                                                     side_effect=lambda r: r,
                                                 ):
                                                     with patch.object(
                                                         flights,
-                                                        "print_compare_table",
-                                                    ) as table:
+                                                        "filter_results",
+                                                        side_effect=lambda r, *a: r,
+                                                    ):
                                                         with patch.object(
                                                             flights,
-                                                            "_log_error",
+                                                            "merge_cabins",
+                                                            side_effect=lambda r: r,
                                                         ):
-                                                            with self.assertRaises(
-                                                                SystemExit
-                                                            ) as ctx:
-                                                                flights.main()
-        self.assertEqual(ctx.exception.code, 1)
-        table.assert_called_once()
-        limiter.record_block.assert_not_called()
+                                                            with patch.object(
+                                                                flights,
+                                                                "print_compare_table",
+                                                            ) as table:
+                                                                with patch.object(
+                                                                    flights,
+                                                                    "print_booking_links",
+                                                                ):
+                                                                    with patch.object(
+                                                                        flights,
+                                                                        "update_price_map",
+                                                                    ) as update:
+                                                                        with patch.object(
+                                                                            flights,
+                                                                            "_log_error",
+                                                                        ):
+                                                                            with self.assertRaises(
+                                                                                SystemExit
+                                                                            ) as ctx:
+                                                                                flights.main()
+                self.assertEqual(ctx.exception.code, 1)
+                update.assert_called_once_with([ob_result])
+                table.assert_called_once()
+                if records_block:
+                    limiter.record_block.assert_called_once_with(
+                        flights.SCAN["block_minutes"]
+                    )
+                else:
+                    limiter.record_block.assert_not_called()
 
 
 class SourceInvariantTests(unittest.TestCase):
-    def test_scan_functions_have_no_live_sleep(self):
+    def test_scan_functions_have_no_live_sleep_and_cache_helper_removed(self):
         for func in (
             flights._scan_dates,
             flights.drift_scan,
             flights.drift_scan_return,
         ):
-            source = inspect.getsource(func)
-            self.assertNotIn("time.sleep(", source)
-            self.assertNotIn("_is_cache_hit", source)
-
-    def test_cache_hit_helper_removed(self):
+            with self.subTest(func=func.__name__):
+                source = inspect.getsource(func)
+                self.assertNotIn("time.sleep(", source)
+                self.assertNotIn("_is_cache_hit", source)
         self.assertFalse(hasattr(flights, "_is_cache_hit"))
 
 
 if __name__ == "__main__":
     unittest.main()
-
-
-class AbortMessageStateErrorTests(unittest.TestCase):
-    def test_rate_state_error_message(self):
-        cause = flights.RateLimited(1200, "2026-10-26T12:20:00+00:00", state_error=True)
-        message = flights._abort_message(flights.ScanAborted([], "rate", cause))
-        self.assertIn("corrupt", message)
-        self.assertIn("--clear-block", message)
-        self.assertNotIn("--force", message)

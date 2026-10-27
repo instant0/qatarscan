@@ -32,9 +32,35 @@ Steps:
 2. Open Chrome devtools → **Network** tab.
 3. Set the filter to **XHR**.
 4. Run a flight search, then search the requests for `flight-offers`.
-5. Select the `flight-offers` request and copy its request headers (in
-   devtools this is available as the `request.headers` object, e.g. via
-   "Copy → Copy as fetch" or the Headers panel).
+5. Select the `flight-offers` request and copy its request headers as raw
+   text: the optional request line plus one `Header: value` line per header.
+
+`--paste` accepts raw request headers, not a fetch/JSON object. The accepted
+format is:
+
+- An optional first line with the raw request line, e.g.
+  `POST /dapi/public/bff/web/flight-search/flight-offers HTTP/2`. If present,
+  the method must be `POST`, the path must be the `flight-offers` path, and a
+  `Host` header must be `www.qatarairways.com` if supplied.
+- Then one `Header: value` per line. A `Cookie: a=b; c=d` line is parsed into
+  the scanner's cookie allowlist. Do not paste a `fetch(...)` call or a JSON
+  object such as `{"headers": {...}}`; those are not parsed.
+
+For example:
+
+```
+POST /dapi/public/bff/web/flight-search/flight-offers HTTP/2
+Host: www.qatarairways.com
+User-Agent: Mozilla/5.0 (...) Firefox/158.0
+session-id: <session id>
+X-AssignedDeviceID: <device id>
+nbx_fs_api_key: <api key>
+Cookie: _abck=...~0~...; bm_sz=...; BIGipServer...=...
+```
+
+A headers-only paste (no request line) is accepted, but the request source is
+reported as unverified (`source=unknown`). A paste with a request line is
+validated against the QR `flight-offers` endpoint before it is saved.
 
 An example of a suitable un-authenticated flight-scans page:
 
@@ -50,30 +76,34 @@ python flights.py [flags]
 Flags:
   -o, --origin CODE         Origin airport (default: OSL)
   -d, --destination CODE    Destination airport (default: BKK)
-  --depart YYYY-MM-DD       Outbound date (default: 2026-08-17)
-  --ret YYYY-MM-DD          Return date (default: 2026-09-04)
-  --drift N                 Shift both dates ±N days, preserve trip length
-  --drift-ret N             Shift return date ±N days, keep outbound fixed
+  --depart YYYY-MM-DD       Outbound date (default: today + 30 days)
+  --ret YYYY-MM-DD          Return date (default: departure + 18 days)
+  --drift N                 Shift both dates ±N days, preserve trip length (0 = exact pair)
+  --drift-ret N             Shift return date ±N days, keep outbound fixed (0 = exact pair)
   --scan                    Scan a range of outbound dates
-  --ob N                    Scan N outbound dates
-  --rb N                    Scan N return dates
-  --top N                   Top N results per scan (default: 5)
-  --max-duration HOURS      Max flight duration (default: 24)
+  --ob N                    Scan outbound ±N days (0 = exact date)
+  --rb N                    Scan return ±N days (0 = exact date)
+  --min-trip N              Minimum trip length in days (0 or greater; default: 8)
+  --weight {price,duration,balanced}
+                            Scan optimization weight (default: price)
+  --top N                   Top N results per scan (positive; default: 5)
+  --max-duration HOURS      Max flight duration in hours (positive; default: 25)
   --max-price CABIN=VAL     Price cap, e.g. ECONOMY=8000,BUSINESS=14000
+                            (only ECONOMY/BUSINESS; integers > 0; case-insensitive)
   --nofilter                Disable price filter
   --all-fares               Include BUSINESS_LITE / BUSINESS_ELITE fares
-  --recommend [N]           Show top N mixed-cabin combos after drift
-  --prune-cache             Archive stale cache entries + trim to 1 year
-  --calendar [MONTH YEAR]   Show price calendar (e.g. "Aug 2026")
-  --trends                  Show price trend analysis from collected data
-  --price-map               Show day-of-week price table
+  --recommend [N]           Show top N mixed-cabin combos after drift (positive; default: 10)
+  --prune-cache             Archive entries dated before today and dedupe/trim the archive to 365 days (no config needed)
+  --calendar [MONTH YEAR]   Show price calendar (e.g. "Aug 2026"; no config needed)
+  --trends                  Show price trend analysis from collected data (no config needed)
+  --price-map               Show day-of-week price table (no config needed)
   --paste                   Paste new browser headers
-  --urls                    Show booking links
+  --urls                    Show booking links (single, scan, and drift modes)
   --nocache                 Bypass offers cache
-  --json                    Output raw JSON
-  --delay SEC               Base spacing between live calls in seconds (default 45, jittered -5/+10)
+  --json                    Output raw JSON (links go to stderr with --urls)
+  --delay SEC               Base spacing between live calls in seconds; must be positive (default 45, jittered -5/+10)
   --max-retries {0,1}       Retry transient 5xx/timeout failures once (default 0; edge/auth/rate/budget are never retried)
-  --budget N                Max live POST calls per run (0 = no limit). Failed/timed-out calls count; cache hits do not.
+  --budget N                Max live POST calls per run; non-negative, 0 = unlimited. Failed/timed-out calls count; cache hits do not.
   --force                   Ignore an active rate-limit cooldown for this run
   --clear-block             Clear the persisted rate-limit cooldown and exit
   --help                    Show this help
@@ -82,7 +112,35 @@ Flags:
 Notes:
   Corrupt/unreadable rate-limit state fails closed. `--force` does not bypass unusable
   state; use `--clear-block` to reset it.
-  `--calendar` and `--trends` can be combined: `python flights.py --trends --calendar`
+  `--calendar` and `--trends` can be combined: `python flights.py --trends --calendar`.
+  `--price-map`, `--prune-cache`, `--calendar`, and `--trends` are local-only and do not
+  require `config.json`; paste and live searches still need a valid config.
+  If `config.json` is corrupt or unreadable it is quarantined and live scans require
+  `--paste`; automatically refreshed cookies are not written over it. Forbidden transport
+  headers in an old config (`Host`, `Content-Length`, `Connection`, `TE`,
+  `Transfer-Encoding`, `Accept-Encoding`, `Cookie`) are dropped before sending. An invalid,
+  unknown, or stale `_abck` prints a `--paste` hint.
+  Corrupt offers-cache, archive, price-map, and currency JSON is copied to
+  `<file>.corrupt-<timestamp>` and treated as empty/default when the file is read for update;
+  read-only views ignore invalid files. Nested JSON shapes are validated before use.
+  `--max-price` accepts only the cabins in the scanner's max-price map (currently
+  `ECONOMY` and `BUSINESS`). Duplicate cabins use the last value. Empty, non-integer,
+  unknown-cabin, and non-positive values are rejected.
+  `--budget 0` means unlimited; negative budgets and non-positive delays are rejected.
+  Numeric ranges are validated: `--ob`, `--rb`, `--drift`, `--drift-ret`, and
+  `--min-trip` accept 0 or greater, while `--top`, `--max-duration`, and
+  `--recommend` require positive integers. Invalid values exit with code 2 and a
+  clear argparse error.
+  Default dates are rolling: departure is today + 30 days and return is
+  departure + 18 days. Explicit `--depart`/`--ret` override them.
+  `--calendar` and `--trends` reuse a stale cached FX rate in-process when the FX
+  endpoint fails, so local views do not retry once per offer.
+  With `--json`, stdout contains only JSON. If `--urls` is also set, booking links are
+  written to stderr so the JSON stays machine-readable. `--json` cannot be combined with
+  `--drift` or `--drift-ret` (exit code 2).
+  Scan and drift runs report partial transient failures as `N/M requests failed` while
+  keeping exit code 0 (unless the run aborted). If every request fails transiently, the run
+  exits 1 instead of reporting no results. Cache hits and skipped dates are not failures.
 
 ## Examples
 

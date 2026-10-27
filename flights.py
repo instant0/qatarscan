@@ -25,11 +25,32 @@ from rich.table import Table
 # SEARCH PARAMETERS
 # ============================================================
 
+
+def _rolling_search_dates(now=None):
+    now = now or datetime.now()
+    departure = (now + timedelta(days=30)).date()
+    return departure.isoformat(), (departure + timedelta(days=18)).isoformat()
+
+
+def _resolve_search_dates(depart=None, ret=None, now=None):
+    default_depart, default_return = _rolling_search_dates(now)
+    departure = depart or default_depart
+    if ret:
+        return departure, ret
+    try:
+        parsed = datetime.strptime(departure, "%Y-%m-%d").date()
+    except ValueError:
+        return departure, default_return
+    return departure, (parsed + timedelta(days=18)).isoformat()
+
+
+_DEFAULT_DEPARTURE, _DEFAULT_RETURN = _rolling_search_dates()
+
 SEARCH = {
     "origin": "OSL",
     "destination": "BKK",
-    "departure_date": "2026-08-17",
-    "return_date": "2026-09-04",
+    "departure_date": _DEFAULT_DEPARTURE,
+    "return_date": _DEFAULT_RETURN,
 }
 
 # ============================================================
@@ -113,12 +134,41 @@ ARCHIVE_MAX_DAYS = 365
 LAYOUT_RANK = {"QSuite": 4, "Door": 3, "Pod": 2, "Old": 1, "Unknown": 0}
 
 
+console = Console()
+log = Console(stderr=True)
+
+
 def load_layouts():
+    default = {"aircraft": {}, "by_flight": {}}
     path = LAYOUTS_FILE
     if not os.path.exists(path):
-        return {"aircraft": {}, "by_flight": {}}
-    with open(path) as f:
-        return json.load(f)
+        return default
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError, ValueError) as e:
+        log.print(
+            f"[yellow]layouts.json is invalid ({escape(str(e))}); "
+            "using empty layout maps.[/yellow]"
+        )
+        return default
+    if not isinstance(data, dict):
+        log.print(
+            "[yellow]layouts.json has an invalid top-level shape; "
+            "using empty layout maps.[/yellow]"
+        )
+        return default
+    aircraft = data.get("aircraft", {})
+    by_flight = data.get("by_flight", {})
+    if not isinstance(aircraft, dict) or not isinstance(by_flight, dict):
+        log.print(
+            "[yellow]layouts.json has invalid container types; "
+            "using empty layout maps.[/yellow]"
+        )
+        return default
+    data["aircraft"] = aircraft
+    data["by_flight"] = by_flight
+    return data
 
 
 layouts = load_layouts()
@@ -127,15 +177,15 @@ layouts = load_layouts()
 def classify_layout(aircraft_code, flight_number, qsuite):
     if qsuite:
         return "QSuite"
+    if not isinstance(layouts, dict):
+        return "Unknown"
     by_flight = layouts.get("by_flight", {})
-    if flight_number in by_flight:
+    if isinstance(by_flight, dict) and flight_number in by_flight:
         return by_flight[flight_number]
     ac_map = layouts.get("aircraft", {})
-    return ac_map.get(aircraft_code, "Unknown")
-
-
-console = Console()
-log = Console(stderr=True)
+    if isinstance(ac_map, dict):
+        return ac_map.get(aircraft_code, "Unknown")
+    return "Unknown"
 
 
 class LocalStateError(Exception):
@@ -173,9 +223,20 @@ def _locked_data():
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
+_quarantine_copies = {}
+
+
 def _quarantine_corrupt(path):
     if not os.path.exists(path):
         return None
+    try:
+        stat = os.stat(path)
+        signature = (stat.st_size, stat.st_mtime_ns)
+    except OSError:
+        signature = None
+    previous = _quarantine_copies.get(path)
+    if previous is not None and previous[0] == signature:
+        return previous[1]
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     dest = f"{path}.corrupt-{stamp}"
     try:
@@ -184,6 +245,7 @@ def _quarantine_corrupt(path):
         raise LocalStateError(
             f"Cannot quarantine corrupt {os.path.basename(path)}: {e}"
         ) from e
+    _quarantine_copies[path] = (signature, dest)
     return dest
 
 
@@ -210,32 +272,111 @@ def _read_json_file(path, default, label, expected_type=dict, quarantine=True):
         return default
 
 
+def _read_validated_json_file(path, default, label, validator, quarantine=True):
+    data = _read_json_file(
+        path, None, label, quarantine=quarantine
+    )
+    if data is None:
+        return default
+    if validator(data):
+        return data
+    if quarantine:
+        dest = _quarantine_corrupt(path)
+        log.print(
+            f"[yellow]{escape(label)} has an invalid shape; "
+            f"quarantined to {escape(dest or path)}[/yellow]"
+        )
+    else:
+        log.print(
+            f"[yellow]{escape(label)} has an invalid shape; ignoring.[/yellow]"
+        )
+    return default
+
+
+def _valid_offers_cache(data):
+    return isinstance(data, dict) and all(
+        isinstance(entry, dict) for entry in data.values()
+    )
+
+
+def _valid_currency_cache(data):
+    return isinstance(data, dict) and all(
+        isinstance(entry, dict) for entry in data.values()
+    )
+
+
+def _valid_price_map(data):
+    if not isinstance(data, dict):
+        return False
+    for days in data.values():
+        if not isinstance(days, dict):
+            return False
+        for patterns in days.values():
+            if not isinstance(patterns, dict):
+                return False
+            for pattern in patterns.values():
+                if not isinstance(pattern, dict):
+                    return False
+                fares = pattern.get("fares", {})
+                if not isinstance(fares, dict):
+                    return False
+                if not all(isinstance(fdata, dict) for fdata in fares.values()):
+                    return False
+    return True
+
+
 # ============================================================
 # CONFIG PERSISTENCE
 # ============================================================
 
 
-def load_config():
-    if not os.path.exists(CONFIG_FILE):
+def _config_age(cfg):
+    saved = cfg.get("saved_at") if isinstance(cfg, dict) else None
+    if not saved:
         return None
-    with open(CONFIG_FILE) as f:
-        cfg = json.load(f)
-    saved = cfg.get("saved_at")
-    if saved:
-        age = datetime.now() - datetime.fromisoformat(saved)
-        if age > timedelta(hours=24):
-            log.print(
-                f"[yellow]Session saved {age.days}d {age.seconds//3600}h ago."
-                f" If requests fail, re-run with --paste.[/yellow]"
-            )
+    try:
+        saved_at = datetime.fromisoformat(saved)
+    except (TypeError, ValueError):
+        return None
+    now = datetime.now(saved_at.tzinfo) if saved_at.tzinfo else datetime.now()
+    return now - saved_at
+
+
+def load_config():
+    cfg = _read_json_file(CONFIG_FILE, None, "config.json")
+    if cfg is None:
+        return None
+    age = _config_age(cfg)
+    if age is not None and age > timedelta(hours=24):
+        log.print(
+            f"[yellow]Session saved {age.days}d {age.seconds//3600}h ago."
+            f" If requests fail, re-run with --paste.[/yellow]"
+        )
     return cfg
 
 
 def save_config(config):
     config["saved_at"] = datetime.now().isoformat()
-    with open(CONFIG_FILE, "w") as f:
-        json.dump(config, f, indent=2)
+    with _locked_data():
+        _atomic_write_json(CONFIG_FILE, config)
     log.print("[green]Config saved to config.json[/green]")
+
+
+def _save_abck_state(state):
+    if not os.path.exists(CONFIG_FILE):
+        return
+    try:
+        with _locked_data():
+            current = _read_json_file(CONFIG_FILE, None, "config.json")
+            if not isinstance(current, dict) or current.get("last_abck_state") == state:
+                return
+            current["last_abck_state"] = state
+            _atomic_write_json(CONFIG_FILE, current)
+    except (OSError, LocalStateError) as e:
+        log.print(
+            f"[yellow]Could not update _abck state in config.json "
+            f"({escape(str(e))}); continuing.[/yellow]"
+        )
 
 
 # ============================================================
@@ -273,13 +414,41 @@ CANONICAL_HEADERS = {
 COOKIE_ALLOWLIST = {"_abck", "bm_sz", "bm_sv", "ak_bmsc", "AKA_A2"}
 COOKIE_ALLOWLIST_PREFIXES = ("BIGipServer", "TS0")
 
+FORBIDDEN_SEND_HEADERS = {
+    "host",
+    "content-length",
+    "connection",
+    "te",
+    "transfer-encoding",
+    "accept-encoding",
+    "cookie",
+}
+
 
 def _cookie_allowed(name):
     return name in COOKIE_ALLOWLIST or name.startswith(COOKIE_ALLOWLIST_PREFIXES)
 
 
+def _sanitize_headers(headers):
+    clean = {}
+    for key, value in (headers or {}).items():
+        if not isinstance(key, str) or not isinstance(value, str):
+            continue
+        name = key.strip()
+        if not name or not value.strip():
+            continue
+        if name.lower() in FORBIDDEN_SEND_HEADERS:
+            continue
+        clean[name] = value
+    return clean
+
+
 def _abck_state(cookies):
+    if not isinstance(cookies, dict):
+        return "unknown"
     value = cookies.get("_abck", "")
+    if not isinstance(value, str):
+        return "unknown"
     if "~0~" in value:
         return "valid"
     if "~-1~" in value:
@@ -328,7 +497,13 @@ def parse_pasted_headers(text):
             host = value
             continue
 
-        if lower in ("content-length", "connection", "te", "accept-encoding"):
+        if lower in (
+            "content-length",
+            "connection",
+            "te",
+            "transfer-encoding",
+            "accept-encoding",
+        ):
             continue
 
         canonical = CANONICAL_HEADERS.get(lower)
@@ -416,8 +591,27 @@ def prompt_paste_headers():
 
 
 def validate_config(cfg):
-    headers = cfg.get("headers") or {}
-    cookies = cfg.get("cookies") or {}
+    if not isinstance(cfg, dict):
+        log.print(
+            "[red]config.json has an invalid shape. Re-run with --paste.[/red]"
+        )
+        return False
+    headers = cfg.get("headers")
+    cookies = cfg.get("cookies")
+    if headers is None:
+        headers = {}
+    if cookies is None:
+        cookies = {}
+    if not isinstance(headers, dict):
+        log.print(
+            "[red]config.json headers are not an object. Re-run with --paste.[/red]"
+        )
+        return False
+    if not isinstance(cookies, dict):
+        log.print(
+            "[red]config.json cookies are not an object. Re-run with --paste.[/red]"
+        )
+        return False
     missing = [h for h in REQUIRED_HEADERS if h not in headers]
     if missing:
         log.print(
@@ -437,6 +631,26 @@ def validate_config(cfg):
             f"[yellow]Missing Akamai cookies: {', '.join(missing_akamai)}; "
             f"requests may be blocked.[/yellow]"
         )
+    state = _abck_state(cookies)
+    cfg["last_abck_state"] = state
+    age = _config_age(cfg)
+    if state == "invalid":
+        log.print(
+            "[yellow]Saved _abck state is invalid; requests may be blocked. "
+            "Re-run with --paste.[/yellow]"
+        )
+    elif state == "unknown":
+        log.print(
+            "[yellow]Saved _abck state is unknown (missing or unrecognized); "
+            "re-run with --paste if requests fail.[/yellow]"
+        )
+    elif age is not None and age > timedelta(hours=24):
+        log.print(
+            f"[yellow]Saved _abck/session is stale ({age.days}d "
+            f"{age.seconds//3600}h old); re-run with --paste before live requests.[/yellow]"
+        )
+    if cfg.get("saved_at"):
+        _save_abck_state(state)
     return True
 
 
@@ -451,6 +665,10 @@ def hhmm(seconds):
     hours = seconds // 3600
     mins = (seconds % 3600) // 60
     return f"{hours}h {mins}m"
+
+
+def _lit(value):
+    return escape(str(value))
 
 
 def booking_url(origin, destination, dep_date, ret_date, cabin):
@@ -524,21 +742,48 @@ def _valid_iso_datetime(value):
     return value
 
 
+def _valid_fare_stats(value):
+    if not isinstance(value, dict):
+        return False
+    for field in ("min", "max", "total"):
+        if _valid_number(value.get(field)) is None:
+            return False
+    samples = value.get("samples")
+    if isinstance(samples, bool) or not isinstance(samples, int) or samples <= 0:
+        return False
+    return True
+
+
+def _hhmm_from_iso(value):
+    if isinstance(value, str) and len(value) >= 16:
+        return value[11:16]
+    return "?"
+
+
 # ============================================================
 # CURRENCY CONVERSION (cache to disk, refetch once per day)
 # ============================================================
 
 _currency_rates = {}
+_FX_FALLBACK_FAILED = "_fallback_failed"
 
 
 def load_currency_rates():
-    return _read_json_file(CURRENCY_FILE, {}, "currency cache")
+    return _read_validated_json_file(
+        CURRENCY_FILE, {}, "currency cache", _valid_currency_cache
+    )
 
 
 def save_currency_rates(rates):
     try:
         with _locked_data():
-            current = _read_json_file(CURRENCY_FILE, {}, "currency cache")
+            current = _read_validated_json_file(
+                CURRENCY_FILE,
+                {},
+                "currency cache",
+                _valid_currency_cache,
+                quarantine=False,
+            )
             current.update(rates)
             _atomic_write_json(CURRENCY_FILE, current)
     except LocalStateError:
@@ -563,6 +808,12 @@ def get_conversion_rate(target_currency):
     today = datetime.now().strftime("%Y-%m-%d")
 
     memory = _currency_rates.get(key)
+    if (
+        isinstance(memory, dict)
+        and memory.get(_FX_FALLBACK_FAILED)
+        and _valid_rate_entry(memory)
+    ):
+        return memory["rate"]
     memory_entry = memory if _valid_rate_entry(memory) else None
     if memory_entry and memory_entry["date"] == today:
         return memory_entry["rate"]
@@ -601,7 +852,9 @@ def get_conversion_rate(target_currency):
                 f"[yellow]FX rate fetch failed ({code}\u2192NOK): {escape(str(e))}; "
                 f"using cached rate from {escape(fallback['date'])}[/yellow]"
             )
-            _currency_rates[key] = fallback
+            cached_fallback = dict(fallback)
+            cached_fallback[_FX_FALLBACK_FAILED] = True
+            _currency_rates[key] = cached_fallback
             return fallback["rate"]
         log.print(
             f"[yellow]FX rate fetch failed ({code}\u2192NOK): {escape(str(e))}; "
@@ -643,12 +896,17 @@ def build_payload(origin, destination, departure_date):
 # ============================================================
 
 
-def parse_results(data, max_duration_hours=None, warn=True):
+def _valid_offers_payload(data):
     if not isinstance(data, dict):
+        return False
+    offers = data.get("flightOffers", [])
+    return isinstance(offers, list)
+
+
+def parse_results(data, max_duration_hours=None, warn=True):
+    if not _valid_offers_payload(data):
         raise RequestFailed(200, "Malformed flight-offers payload")
     offers = data.get("flightOffers", [])
-    if not isinstance(offers, list):
-        raise RequestFailed(200, "Malformed flight-offers payload")
 
     output = []
     skipped_offers = 0
@@ -811,8 +1069,12 @@ def convert_prices(results, warn=True):
 def compute_transfer_minutes(segments):
     max_transfer = 0
     for i in range(len(segments) - 1):
-        arr = segments[i].get("arrival", "")
-        dep = segments[i + 1].get("departure", "")
+        current = segments[i]
+        following = segments[i + 1]
+        if not isinstance(current, dict) or not isinstance(following, dict):
+            continue
+        arr = current.get("arrival", "")
+        dep = following.get("departure", "")
         if arr and dep:
             try:
                 a = datetime.fromisoformat(arr)
@@ -831,7 +1093,9 @@ def update_price_map(results):
 
     try:
         with _locked_data():
-            existing = _read_json_file(PRICE_MAP_FILE, {}, "price map")
+            existing = _read_validated_json_file(
+                PRICE_MAP_FILE, {}, "price map", _valid_price_map
+            )
 
             for r in results:
                 if not isinstance(r, dict):
@@ -839,10 +1103,15 @@ def update_price_map(results):
                 date = r.get("departure_date")
                 fare = r.get("fare")
                 segs = r.get("segments", [])
+                if not isinstance(date, str) or not isinstance(fare, str):
+                    continue
                 if not date or not fare or not isinstance(segs, list) or not segs:
                     continue
 
-                stops = r.get("stops", 0)
+                raw_stops = _valid_number(r.get("stops", 0))
+                if raw_stops is None:
+                    continue
+                stops = int(raw_stops)
                 if stops > 1:
                     continue
 
@@ -854,15 +1123,15 @@ def update_price_map(results):
                     day = datetime.strptime(date, "%Y-%m-%d").strftime("%a")
                 except (TypeError, ValueError):
                     continue
-                price = r.get("price")
+                price = _valid_number(r.get("price"))
                 if price is None:
                     continue
 
                 first = segs[0] if isinstance(segs[0], dict) else {}
                 last = segs[-1] if isinstance(segs[-1], dict) else {}
                 flight_num = first.get("flight", "?")
-                dep_time = first.get("departure", "")[11:16] if first.get("departure") else "?"
-                arr_time = last.get("arrival", "")[11:16] if last.get("arrival") else "?"
+                dep_time = _hhmm_from_iso(first.get("departure"))
+                arr_time = _hhmm_from_iso(last.get("arrival"))
                 transfer = compute_transfer_minutes(segs)
                 direct = stops == 1
 
@@ -891,7 +1160,7 @@ def update_price_map(results):
                     entry["arrival"] = arr_time
 
                 fdata = entry["fares"].get(fare)
-                if not isinstance(fdata, dict):
+                if not _valid_fare_stats(fdata):
                     entry["fares"][fare] = {
                         "min": price,
                         "max": price,
@@ -915,9 +1184,9 @@ def update_price_map(results):
 
 def _fare_cell(fdata):
     W = 10
-    if not fdata:
+    if not _valid_fare_stats(fdata):
         return f"{'-':>{W}}"
-    avg = fdata["total"] // fdata["samples"]
+    avg = int(fdata["total"] // fdata["samples"])
     s = f"{avg}({fdata['samples']})"
     return f"{s:>{W}}"
 
@@ -927,8 +1196,8 @@ def print_price_map():
         console.print("[yellow]No price map data yet. Run a drift or scan first.[/yellow]")
         return
 
-    data = _read_json_file(
-        PRICE_MAP_FILE, {}, "price map", quarantine=False
+    data = _read_validated_json_file(
+        PRICE_MAP_FILE, {}, "price map", _valid_price_map, quarantine=False
     )
 
     if not data:
@@ -946,8 +1215,11 @@ def print_price_map():
     ]
 
     for direction, days in sorted(data.items()):
-        origin, dest = direction.split("_")
-        console.print(f"\n[bold]{origin} \u2192 {dest}[/bold]")
+        parts = direction.split("_", 1)
+        if len(parts) != 2 or not isinstance(days, dict):
+            continue
+        origin, dest = parts
+        console.print(f"\n[bold]{_lit(origin)} \u2192 {_lit(dest)}[/bold]")
 
         hdr = f"{'Day':<4} {'Flight':<7} {'Dep':<5} {'Arr':<5} {'Xfer':>5} {'Stp':>3}"
         for short, _ in fare_cols:
@@ -955,24 +1227,39 @@ def print_price_map():
         console.print(hdr, style="dim")
 
         for day in ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]:
-            if day not in days:
+            day_patterns = days.get(day)
+            if not isinstance(day_patterns, dict):
                 continue
 
-            patterns = sorted(days[day].items(), key=lambda x: x[1].get("departure", ""))
+            patterns = sorted(
+                (
+                    (key, value)
+                    for key, value in day_patterns.items()
+                    if isinstance(value, dict)
+                ),
+                key=lambda item: str(item[1].get("departure", "")),
+            )
 
             for pat_key, pat in patterns:
                 dep = pat.get("departure", "?")
                 arr = pat.get("arrival", "?")
-                xfer = f"{pat['transfer_minutes']}m" if pat.get("transfer_minutes") else "-"
-                stops = pat["stops"]
+                stops = pat.get("stops", "?")
                 flight = pat.get("flight", "?")
+                dep = "?" if dep is None else dep
+                arr = "?" if arr is None else arr
+                stops = "?" if stops is None else stops
+                flight = "?" if flight is None else flight
+                xfer = f"{pat['transfer_minutes']}m" if pat.get("transfer_minutes") else "-"
+                fares = pat.get("fares")
+                if not isinstance(fares, dict):
+                    fares = {}
 
                 line = f"{day:<4} {flight:<7} {dep:<5} {arr:<5} {xfer:>5} {stops:>3}"
 
                 for _, fcode in fare_cols:
-                    line += _fare_cell(pat["fares"].get(fcode))
+                    line += _fare_cell(fares.get(fcode))
 
-                console.print(line)
+                console.print(escape(line))
 
         console.print()
 
@@ -1004,6 +1291,10 @@ def _load_archive_prices():
             continue
         origin, destination = parts[0], parts[1]
         date_str = "_".join(parts[2:])
+        try:
+            datetime.strptime(date_str, "%Y-%m-%d")
+        except (TypeError, ValueError):
+            continue
         direction_dir = f"{origin}_{destination}"
         try:
             parsed = parse_results(data, warn=False)
@@ -1012,8 +1303,8 @@ def _load_archive_prices():
         convert_prices(parsed, warn=False)
         for r in parsed:
             fare = r.get("fare")
-            price = r.get("price")
-            if not fare or price is None:
+            price = _valid_number(r.get("price"))
+            if not isinstance(fare, str) or not fare or price is None:
                 continue
             per_date.setdefault(date_str, {}).setdefault(direction_dir, {}).setdefault(fare, []).append(price)
     result = {}
@@ -1053,25 +1344,49 @@ def _parse_calendar_arg(raw):
 
 
 def _min_fare_for_date(price_data, direction, date_str, fare_filter, archive_prices=None):
-    if archive_prices:
-        archive_entry = archive_prices.get(date_str, {}).get(direction, {})
-        if archive_entry:
+    if isinstance(archive_prices, dict):
+        date_entry = archive_prices.get(date_str)
+        archive_entry = (
+            date_entry.get(direction) if isinstance(date_entry, dict) else None
+        )
+        if isinstance(archive_entry, dict) and archive_entry:
             best = None
             for fare, price in archive_entry.items():
+                if not isinstance(fare, str):
+                    continue
                 if fare_filter and fare not in fare_filter:
                     continue
-                if best is None or price < best:
-                    best = price
+                value = _valid_number(price)
+                if value is None:
+                    continue
+                if best is None or value < best:
+                    best = value
             if best is not None:
                 return best
     day_name = datetime.strptime(date_str, "%Y-%m-%d").strftime("%a")
-    day_data = price_data.get(direction, {}).get(day_name, {})
+    if not isinstance(price_data, dict):
+        return None
+    directions = price_data.get(direction)
+    if not isinstance(directions, dict):
+        return None
+    day_data = directions.get(day_name)
+    if not isinstance(day_data, dict):
+        return None
     best = None
-    for pat_key, pat in day_data.items():
-        for fcode, fdata in pat.get("fares", {}).items():
+    for pat in day_data.values():
+        if not isinstance(pat, dict):
+            continue
+        fares = pat.get("fares")
+        if not isinstance(fares, dict):
+            continue
+        for fcode, fdata in fares.items():
+            if not isinstance(fcode, str):
+                continue
             if fare_filter and fcode not in fare_filter:
                 continue
-            avg = fdata["total"] // fdata["samples"]
+            if not _valid_fare_stats(fdata):
+                continue
+            avg = int(fdata["total"] // fdata["samples"])
             if best is None or avg < best:
                 best = avg
     return best
@@ -1081,9 +1396,11 @@ def print_price_calendar(year, month, origin, destination, fare_filter=None, arc
     if not os.path.exists(PRICE_MAP_FILE):
         console.print("[yellow]No price map data yet. Run a drift or scan first.[/yellow]")
         return
-    data = _read_json_file(
-        PRICE_MAP_FILE, {}, "price map", quarantine=False
+    data = _read_validated_json_file(
+        PRICE_MAP_FILE, {}, "price map", _valid_price_map, quarantine=False
     )
+    if not isinstance(archive_prices, dict):
+        archive_prices = {}
 
     direction = f"{origin}_{destination}"
     rev_direction = f"{destination}_{origin}"
@@ -1093,10 +1410,13 @@ def print_price_calendar(year, month, origin, destination, fare_filter=None, arc
     month_name = datetime(year, month, 1).strftime("%B %Y")
 
     for lbl, dkey in [(f"{origin} \u2192 {destination}", direction), (f"{destination} \u2192 {origin}", rev_direction)]:
-        has_data = dkey in data or (archive_prices and any(a.get(dkey) for a in archive_prices.values()))
+        has_data = dkey in data or any(
+            isinstance(a, dict) and a.get(dkey)
+            for a in archive_prices.values()
+        )
         if not has_data:
             continue
-        console.print(f"\n[bold]{month_name} \u2014 {lbl}[/bold]")
+        console.print(f"\n[bold]{_lit(month_name)} \u2014 {_lit(lbl)}[/bold]")
         W = 6
         console.print("".join(f"  {d:<{W-2}}" for d in ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]), style="dim")
 
@@ -1142,19 +1462,26 @@ def print_price_trends(origin, destination, archive_prices=None):
     if not os.path.exists(PRICE_MAP_FILE):
         console.print("[yellow]No price map data yet. Run a drift or scan first.[/yellow]")
         return
-    price_map = _read_json_file(
-        PRICE_MAP_FILE, {}, "price map", quarantine=False
+    price_map = _read_validated_json_file(
+        PRICE_MAP_FILE, {}, "price map", _valid_price_map, quarantine=False
     )
+    if not isinstance(archive_prices, dict):
+        archive_prices = {}
 
     direction = f"{origin}_{destination}"
     rev_direction = f"{destination}_{origin}"
 
     for lbl, dkey in [(f"{origin} \u2192 {destination}", direction), (f"{destination} \u2192 {origin}", rev_direction)]:
         day_data = price_map.get(dkey, {})
-        has_archive = archive_prices and any(a.get(dkey) for a in archive_prices.values())
+        if not isinstance(day_data, dict):
+            day_data = {}
+        has_archive = any(
+            isinstance(a, dict) and dkey in a
+            for a in archive_prices.values()
+        )
         if not day_data and not has_archive:
             continue
-        console.print(f"\n[bold]Price Trends \u2014 {lbl}[/bold]")
+        console.print(f"\n[bold]Price Trends \u2014 {_lit(lbl)}[/bold]")
 
         day_order = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
         day_stats = {}
@@ -1162,10 +1489,19 @@ def print_price_trends(origin, destination, archive_prices=None):
         all_prices = []
 
         for day_name, patterns in day_data.items():
+            if not isinstance(day_name, str) or not isinstance(patterns, dict):
+                continue
             totals = []
-            for pat_key, pat in patterns.items():
-                for fcode, fdata in pat.get("fares", {}).items():
-                    avg = fdata["total"] // fdata["samples"]
+            for pat in patterns.values():
+                if not isinstance(pat, dict):
+                    continue
+                fares = pat.get("fares")
+                if not isinstance(fares, dict):
+                    continue
+                for fcode, fdata in fares.items():
+                    if not isinstance(fcode, str) or not _valid_fare_stats(fdata):
+                        continue
+                    avg = int(fdata["total"] // fdata["samples"])
                     totals.append(avg)
                     all_fares.setdefault(fcode, 0)
                     all_fares[fcode] += fdata["samples"]
@@ -1178,24 +1514,34 @@ def print_price_trends(origin, destination, archive_prices=None):
                     "count": len(totals),
                 }
 
-        if archive_prices:
-            for date_str, directions in archive_prices.items():
-                if dkey not in directions:
-                    continue
+        for date_str, directions in archive_prices.items():
+            if not isinstance(date_str, str) or not isinstance(directions, dict):
+                continue
+            if dkey not in directions:
+                continue
+            try:
                 day_name = datetime.strptime(date_str, "%Y-%m-%d").strftime("%a")
-                for fare, price in directions[dkey].items():
-                    all_fares.setdefault(fare, 0)
-                    all_fares[fare] += 1
-                    all_prices.append(price)
-                    if day_name not in day_stats:
-                        day_stats[day_name] = {"avg": price, "min": price, "max": price, "count": 1}
-                    else:
-                        s = day_stats[day_name]
-                        s["min"] = min(s["min"], price)
-                        s["max"] = max(s["max"], price)
-                        s["total"] = s.get("total", s["avg"] * s["count"]) + price
-                        s["count"] += 1
-                        s["avg"] = s["total"] // s["count"]
+            except (TypeError, ValueError):
+                continue
+            entry = directions.get(dkey)
+            if not isinstance(entry, dict):
+                continue
+            for fare, price in entry.items():
+                value = _valid_number(price)
+                if not isinstance(fare, str) or value is None:
+                    continue
+                all_fares.setdefault(fare, 0)
+                all_fares[fare] += 1
+                all_prices.append(value)
+                if day_name not in day_stats:
+                    day_stats[day_name] = {"avg": value, "min": value, "max": value, "count": 1}
+                else:
+                    s = day_stats[day_name]
+                    s["min"] = min(s["min"], value)
+                    s["max"] = max(s["max"], value)
+                    s["total"] = s.get("total", s["avg"] * s["count"]) + value
+                    s["count"] += 1
+                    s["avg"] = s["total"] // s["count"]
 
         if not day_stats:
             console.print("   No data\n")
@@ -1204,8 +1550,8 @@ def print_price_trends(origin, destination, archive_prices=None):
         best_day = min(day_order, key=lambda d: day_stats.get(d, {}).get("avg", 999999))
         worst_day = max(day_order, key=lambda d: day_stats.get(d, {}).get("avg", 0))
 
-        console.print(f"   Cheapest day:  [green]{best_day}[/green] (avg {day_stats[best_day]['avg']})" if best_day in day_stats else "")
-        console.print(f"   Most expensive: [red]{worst_day}[/red] (avg {day_stats[worst_day]['avg']})" if worst_day in day_stats else "")
+        console.print(f"   Cheapest day:  [green]{_lit(best_day)}[/green] (avg {_lit(day_stats[best_day]['avg'])})" if best_day in day_stats else "")
+        console.print(f"   Most expensive: [red]{_lit(worst_day)}[/red] (avg {_lit(day_stats[worst_day]['avg'])})" if worst_day in day_stats else "")
 
         if all_prices:
             avg_p = sum(all_prices) // len(all_prices)
@@ -1213,7 +1559,10 @@ def print_price_trends(origin, destination, archive_prices=None):
             vol = (stddev / avg_p) * 100 if avg_p else 0
             console.print(f"   Volatility:     \u00b1{vol:.1f}%")
 
-        console.print(f"   Fare classes:  {', '.join(sorted(all_fares.keys()))}" if all_fares else "")
+        console.print(
+            f"   Fare classes:  {', '.join(_lit(f) for f in sorted(all_fares.keys()))}"
+            if all_fares else ""
+        )
 
         table = Table(box=SIMPLE_HEAVY, header_style="bold cyan")
         table.add_column("Day", style="white")
@@ -1255,6 +1604,9 @@ def merge_cabins(results):
                 "stops": r["stops"],
                 "segments": r["segments"],
                 "cabins": {},
+                "_dep_date": r.get("_dep_date"),
+                "_ret_date": r.get("_ret_date"),
+                "_direction": r.get("_direction"),
             }
         cabin = r["cabin"]
         group = groups[key]
@@ -1336,7 +1688,7 @@ def print_compare_table(results, title="Flight Results", filter_note=None):
     if not results:
         console.print("[yellow]No results found.[/yellow]")
         return
-    table = Table(title=title, box=SIMPLE_HEAVY, header_style="bold cyan")
+    table = Table(title=_lit(title), box=SIMPLE_HEAVY, header_style="bold cyan")
     table.add_column("Date", style="white")
     table.add_column("Route", style="white")
     table.add_column("Dur", style="yellow")
@@ -1355,8 +1707,11 @@ def print_compare_table(results, title="Flight Results", filter_note=None):
             return "-"
         currency = fares[0].get("currency", "")
         converted = fares[0].get("_converted")
-        label = "NOK*" if converted else (currency if currency else "")
-        parts = [f"{FARE_SHORT.get(f['fare'], f['fare'])} {f['price']}" for f in fares]
+        label = "NOK*" if converted else currency
+        parts = [
+            f"{FARE_SHORT.get(f['fare'], f['fare'])} {f['price']}"
+            for f in fares
+        ]
         return " / ".join(parts) + (f" {label}" if label else "")
 
     for r in results:
@@ -1381,28 +1736,33 @@ def print_compare_table(results, title="Flight Results", filter_note=None):
         seats_str = " ".join(all_seats) if all_seats else "-"
 
         table.add_row(
-            r.get("departure_date", ""),
-            f"{r.get('origin','')}\u2192{r.get('destination','')}",
-            r["duration"] or "-",
-            flights,
-            acodes,
-            layouts,
-            dep_time,
-            arr_time,
-            econ_str,
-            biz_str,
-            seats_str,
+            _lit(r.get("departure_date", "")),
+            f"{_lit(r.get('origin',''))}\u2192{_lit(r.get('destination',''))}",
+            _lit(r["duration"] or "-"),
+            _lit(flights),
+            _lit(acodes),
+            _lit(layouts),
+            _lit(dep_time),
+            _lit(arr_time),
+            _lit(econ_str),
+            _lit(biz_str),
+            _lit(seats_str),
         )
 
     console.print(table)
     console.print(FARE_LEGEND, style="white")
     if filter_note:
-        console.print(filter_note, style="dim white")
+        console.print(_lit(filter_note), style="dim white")
 
 
 def print_json(results):
     clean = [{k: v for k, v in r.items() if not k.startswith("_")} for r in results]
-    console.print(json.dumps(clean, indent=2, ensure_ascii=False))
+    console.print(
+        json.dumps(clean, indent=2, ensure_ascii=False),
+        markup=False,
+        highlight=False,
+        soft_wrap=True,
+    )
 
 
 def print_json_combined(data):
@@ -1411,7 +1771,12 @@ def print_json_combined(data):
         clean[direction] = [
             {k: v for k, v in r.items() if not k.startswith("_")} for r in items
         ]
-    console.print(json.dumps(clean, indent=2, ensure_ascii=False))
+    console.print(
+        json.dumps(clean, indent=2, ensure_ascii=False),
+        markup=False,
+        highlight=False,
+        soft_wrap=True,
+    )
 
 
 # ============================================================
@@ -1427,13 +1792,21 @@ def set_nocache(val):
 
 
 def load_offers_cache():
-    return _read_json_file(OFFERS_CACHE_FILE, {}, "offers cache")
+    return _read_validated_json_file(
+        OFFERS_CACHE_FILE, {}, "offers cache", _valid_offers_cache
+    )
 
 
 def save_offers_cache(cache):
     try:
         with _locked_data():
-            current = _read_json_file(OFFERS_CACHE_FILE, {}, "offers cache")
+            current = _read_validated_json_file(
+                OFFERS_CACHE_FILE,
+                {},
+                "offers cache",
+                _valid_offers_cache,
+                quarantine=False,
+            )
             current.update(cache)
             _atomic_write_json(OFFERS_CACHE_FILE, current)
     except LocalStateError:
@@ -1447,16 +1820,13 @@ def archive_stale_cache():
         return 0
     try:
         with _locked_data():
-            cache = _read_json_file(OFFERS_CACHE_FILE, {}, "offers cache")
+            cache = load_offers_cache()
             if not cache:
                 return 0
             today = datetime.now().strftime("%Y-%m-%d")
             stale = {}
             fresh = {}
             for key, entry in cache.items():
-                if not isinstance(entry, dict):
-                    fresh[key] = entry
-                    continue
                 entry_date = entry.get("date", "")
                 if not isinstance(entry_date, str):
                     fresh[key] = entry
@@ -1472,7 +1842,11 @@ def archive_stale_cache():
             now = datetime.now(timezone.utc).isoformat()
             archive_by_key = {}
             for a in archive:
-                if isinstance(a, dict) and a.get("key"):
+                if (
+                    isinstance(a, dict)
+                    and isinstance(a.get("key"), str)
+                    and a["key"]
+                ):
                     archive_by_key[a["key"]] = a
             for key, entry in stale.items():
                 archive_by_key[key] = {
@@ -1548,7 +1922,7 @@ class RateLimiter:
         self.state_file = RATE_STATE_FILE if state_file is None else state_file
         self.lock_file = RATE_LOCK_FILE if lock_file is None else lock_file
         self.base_delay = SCAN["delay_seconds"] if base_delay is None else base_delay
-        self.budget = budget
+        self.budget = None if budget == 0 else budget
         self.force = force
         self.clock = clock or (lambda: datetime.now(timezone.utc))
         self.sleep = sleep or time.sleep
@@ -1847,22 +2221,28 @@ class ScanAborted(Exception):
         super().__init__(reason)
 
 
+BODY_SUMMARY_LIMIT = 300
+BODY_SCAN_LIMIT = 8192
+EDGE_REFERENCE_LIMIT = 16384
+
+
 def _safe_body_summary(body):
-    text = " ".join((body or "").split())
-    lowered = text.lower()
+    text = body if isinstance(body, str) else str(body or "")
+    sample = text[:BODY_SCAN_LIMIT]
+    lowered = sample.lower()
     if any(
         marker in lowered
         for marker in ("<html", "<!doctype", "access denied", "edgesuite")
     ):
         return "HTML response body (omitted)"
-    return text[:200]
+    return " ".join(sample.split())[:BODY_SUMMARY_LIMIT]
 
 
 class RequestFailed(Exception):
     def __init__(self, status, body):
         self.status = status
-        self.body = body or ""
-        self.body_summary = _safe_body_summary(self.body)
+        self.body_summary = _safe_body_summary(body)
+        self.body = self.body_summary
         if status == 0:
             message = "Network error"
         else:
@@ -1925,7 +2305,8 @@ def _log_error(text):
 
 
 def _edge_reference(body):
-    match = re.search(r"Reference #([A-Za-z0-9.]+)", body or "", re.I)
+    text = body if isinstance(body, str) else str(body or "")
+    match = re.search(r"Reference #([A-Za-z0-9.]+)", text[:EDGE_REFERENCE_LIMIT], re.I)
     return match.group(1) if match else None
 
 
@@ -1988,13 +2369,15 @@ def classify_block(status, body):
 
 class HttpClient:
     def __init__(self, headers, cookies):
-        self.headers = dict(headers)
-        self.cookies = cookies
+        self.headers = _sanitize_headers(headers)
+        self.cookies = cookies if cookies is not None else {}
         self.session = requests.Session()
-        self.session.cookies.update(cookies)
+        self.session.cookies.update(
+            {name: value for name, value in self.cookies.items() if _cookie_allowed(name)}
+        )
 
     def post_offers(self, payload, referer):
-        headers = dict(self.headers)
+        headers = _sanitize_headers(self.headers)
         headers.update(make_trace_headers())
         headers["Referer"] = referer
         resp = self.session.post(
@@ -2003,20 +2386,52 @@ class HttpClient:
             json=payload,
             timeout=30,
         )
-        self.cookies.update(self.session.cookies.get_dict())
+        updated = self.session.cookies.get_dict()
+        self.cookies.update(
+            {name: value for name, value in updated.items() if _cookie_allowed(name)}
+        )
         return resp
 
 
 def _persist_cookies(cookies):
-    cfg = {}
-    if os.path.exists(CONFIG_FILE):
+    cookies = {
+        name: value
+        for name, value in dict(cookies or {}).items()
+        if _cookie_allowed(name)
+    }
+    if not os.path.exists(CONFIG_FILE):
+        save_config({"cookies": cookies})
+        return
+    try:
+        with open(CONFIG_FILE) as f:
+            cfg = json.load(f)
+        if not isinstance(cfg, dict):
+            raise ValueError("expected a JSON object")
+    except (json.JSONDecodeError, OSError, ValueError) as e:
         try:
-            with open(CONFIG_FILE) as f:
-                cfg = json.load(f)
-        except (json.JSONDecodeError, OSError):
-            cfg = {}
+            dest = _quarantine_corrupt(CONFIG_FILE)
+        except LocalStateError as quarantine_error:
+            log.print(
+                f"[yellow]config.json is corrupt and could not be quarantined "
+                f"({escape(str(quarantine_error))}); automatic cookie persistence "
+                f"skipped. Re-run with --paste.[/yellow]"
+            )
+            return
+        log.print(
+            f"[yellow]config.json is corrupt ({escape(str(e))}); quarantined to "
+            f"{escape(dest or CONFIG_FILE)}; automatic cookie persistence skipped. "
+            f"Re-run with --paste.[/yellow]"
+        )
+        return
     cfg["cookies"] = cookies
-    save_config(cfg)
+    cfg["last_abck_state"] = _abck_state(cookies)
+    try:
+        save_config(cfg)
+    except (OSError, LocalStateError) as e:
+        log.print(
+            f"[yellow]Could not save refreshed cookies to config.json "
+            f"({escape(str(e))}); continuing.[/yellow]"
+        )
 
 
 def fetch_flights(headers, cookies, origin, destination, departure_date, referer=None):
@@ -2026,8 +2441,12 @@ def fetch_flights(headers, cookies, origin, destination, departure_date, referer
     cache = load_offers_cache()
 
     if not _nocache:
-        entry = cache.get(cache_key)
-        if entry and entry.get("date") == today:
+        entry = cache.get(cache_key) if isinstance(cache, dict) else None
+        if (
+            isinstance(entry, dict)
+            and entry.get("date") == today
+            and "data" in entry
+        ):
             log.print(f"[dim]Cached {cache_key}[/dim]")
             return entry["data"], 200, None
 
@@ -2062,6 +2481,8 @@ def fetch_flights(headers, cookies, origin, destination, departure_date, referer
         data = resp.json()
     except ValueError as e:
         raise RequestFailed(resp.status_code, "Non-JSON response") from e
+    if not _valid_offers_payload(data):
+        raise RequestFailed(resp.status_code, "Malformed flight-offers payload")
     cache[cache_key] = {"date": today, "data": data}
     save_offers_cache(cache)
     return data, resp.status_code, None
@@ -2083,21 +2504,42 @@ def _fetch_with_retries(headers, cookies, origin, destination, departure_date, r
             )
 
 
-def _fetch_and_parse(headers, cookies, origin, destination, date_str, dep_date, ret_date, direction, max_dur):
+def _count_failure(stats):
+    if stats is not None:
+        stats["failures"] = stats.get("failures", 0) + 1
+
+
+def _fetch_and_parse(
+    headers,
+    cookies,
+    origin,
+    destination,
+    date_str,
+    dep_date,
+    ret_date,
+    direction,
+    max_dur,
+    stats=None,
+):
+    if stats is not None:
+        stats["calls"] = stats.get("calls", 0) + 1
     referer = build_referer(SEARCH["origin"], SEARCH["destination"], dep_date, ret_date)
     try:
         data, status, err = _fetch_with_retries(
             headers, cookies, origin, destination, date_str, referer=referer
         )
     except RequestFailed as e:
+        _count_failure(stats)
         _log_error(f"  {e}")
         return []
     if data is None:
+        _count_failure(stats)
         _log_error(f"  HTTP {status}: {err}")
         return []
     try:
         results = parse_results(data, max_dur)
     except RequestFailed as e:
+        _count_failure(stats)
         _log_error(f"  {e}")
         return []
     convert_prices(results)
@@ -2109,9 +2551,77 @@ def _fetch_and_parse(headers, cookies, origin, destination, date_str, dep_date, 
     return results
 
 
+def _report_scan_failures(stats):
+    calls = stats.get("calls", 0)
+    failures = stats.get("failures", 0)
+    if calls > 0 and failures == calls:
+        log.print(
+            f"[red]All {calls} request(s) failed; no usable data.[/red]"
+        )
+        return "all_failed"
+    if 0 < failures < calls:
+        log.print(f"[yellow]{failures}/{calls} requests failed.[/yellow]")
+    return None
+
+
 # ============================================================
 # CLI
 # ============================================================
+
+
+def _parse_max_price(value):
+    limits = {}
+    for part in value.split(","):
+        if "=" not in part:
+            raise argparse.ArgumentTypeError(
+                "expected CABIN=PRICE (e.g. ECONOMY=8000,BUSINESS=14000)"
+            )
+        cabin, raw_price = part.split("=", 1)
+        cabin = cabin.strip().upper()
+        raw_price = raw_price.strip()
+        if not cabin:
+            raise argparse.ArgumentTypeError("cabin name cannot be empty")
+        if cabin not in SCAN["max_price"]:
+            allowed = ", ".join(sorted(SCAN["max_price"]))
+            raise argparse.ArgumentTypeError(
+                f"unknown cabin {cabin!r}; expected one of: {allowed}"
+            )
+        if not raw_price:
+            raise argparse.ArgumentTypeError(f"missing price for cabin {cabin}")
+        try:
+            price = int(raw_price)
+        except ValueError:
+            raise argparse.ArgumentTypeError(
+                f"invalid integer price for cabin {cabin}: {raw_price!r}"
+            ) from None
+        if price <= 0:
+            raise argparse.ArgumentTypeError(
+                f"price for cabin {cabin} must be greater than zero"
+            )
+        limits[cabin] = price
+    if not limits:
+        raise argparse.ArgumentTypeError("no valid CABIN=PRICE limits provided")
+    return limits
+
+
+def _non_negative_int(value):
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(f"invalid integer value: {value!r}") from None
+    if number < 0:
+        raise argparse.ArgumentTypeError(f"must be non-negative: {value!r}")
+    return number
+
+
+def _positive_int(value):
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(f"invalid integer value: {value!r}") from None
+    if number <= 0:
+        raise argparse.ArgumentTypeError(f"must be positive: {value!r}")
+    return number
 
 
 def parse_args(argv=None):
@@ -2136,34 +2646,37 @@ def parse_args(argv=None):
     p.add_argument("--paste", action="store_true", help="Paste fresh browser headers and save as config")
     p.add_argument("--json", action="store_true", help="Output raw JSON instead of table")
     p.add_argument("--scan", action="store_true", help="Enable scan mode (scan outbound by default)")
-    p.add_argument("--ob", type=int, default=None, metavar="DAYS", help="Scan \u00b1DAYS for outbound")
-    p.add_argument("--rb", type=int, default=None, metavar="DAYS", help="Scan \u00b1DAYS for return")
-    p.add_argument("--min-trip", type=int, default=None, metavar="DAYS", help="Minimum trip length in days")
+    p.add_argument("--ob", type=_non_negative_int, default=None, metavar="DAYS", help="Scan \u00b1DAYS for outbound (0 = exact date)")
+    p.add_argument("--rb", type=_non_negative_int, default=None, metavar="DAYS", help="Scan \u00b1DAYS for return (0 = exact date)")
+    p.add_argument("--min-trip", type=_non_negative_int, default=None, metavar="DAYS", help="Minimum trip length in days (0 allowed)")
     p.add_argument("--weight", choices=["price", "duration", "balanced"], default=None, help="Optimization weight")
-    p.add_argument("--max-price", type=str, default=None, metavar="CABIN=VAL,...", help="e.g. ECONOMY=9000,BUSINESS=15000")
-    p.add_argument("--max-duration", type=int, default=None, metavar="HOURS", help="Max flight duration in hours")
-    p.add_argument("--top", type=int, default=None, metavar="N", help="Show top N results")
+    p.add_argument("--max-price", type=_parse_max_price, default=None, metavar="CABIN=VAL,...", help="e.g. ECONOMY=9000,BUSINESS=15000 (value > 0; cabin names case-insensitive)")
+    p.add_argument("--max-duration", type=_positive_int, default=None, metavar="HOURS", help="Max flight duration in hours (positive)")
+    p.add_argument("--top", type=_positive_int, default=None, metavar="N", help="Show top N results (positive)")
     p.add_argument("--urls", action="store_true", help="Show booking URLs for date pairs")
     p.add_argument("--nocache", action="store_true", help="Bypass offers cache, fetch fresh data")
     p.add_argument("--nofilter", action="store_true", help="Disable max-price filtering, show all results")
-    p.add_argument("--drift", type=int, default=None, metavar="N", help="Scan drift: ±N days shifting both outbound+return together")
-    p.add_argument("--drift-ret", type=int, default=None, metavar="N", help="Scan drift on return only: ±N days shifting return date, outbound fixed")
-    p.add_argument("--delay", type=int, default=None, metavar="SEC", help="Base spacing between live calls in seconds (default 45, jittered -5/+10)")
+    p.add_argument("--drift", type=_non_negative_int, default=None, metavar="N", help="Scan drift: ±N days shifting both outbound+return together (0 = exact pair)")
+    p.add_argument("--drift-ret", type=_non_negative_int, default=None, metavar="N", help="Scan drift on return only: ±N days shifting return date, outbound fixed (0 = exact pair)")
+    p.add_argument("--delay", type=_positive_int, default=None, metavar="SEC", help="Base spacing between live calls in seconds; must be positive (default 45, jittered -5/+10)")
     p.add_argument("--max-retries", type=int, choices=[0, 1], default=0, metavar="{0,1}", help="Retry transient 5xx/timeout failures once (edge/auth/rate/budget are never retried)")
-    p.add_argument("--budget", type=int, default=None, metavar="N", help="Maximum live POST attempts per run (default: unlimited)")
+    p.add_argument("--budget", type=_non_negative_int, default=None, metavar="N", help="Maximum live POST attempts per run (0 = unlimited; default: unlimited)")
     p.add_argument("--force", action="store_true", help="Ignore an active rate-limit cooldown for this run")
     p.add_argument("--clear-block", action="store_true", help="Clear the persisted rate-limit cooldown and exit")
     p.add_argument("--price-map", action="store_true", help="Show price map (day-of-week price trends from collected data)")
-    p.add_argument("--recommend", type=int, default=None, const=10, nargs="?", metavar="N", help="Show top N mixed-cabin combos (default 10)")
+    p.add_argument("--recommend", type=_positive_int, default=None, const=10, nargs="?", metavar="N", help="Show top N mixed-cabin combos (positive; default 10)")
     p.add_argument("--all-fares", action="store_true", help="Include BUSINESS_LITE, BUSINESS_ELITE (excluded by default; ECONOMY_LITE/FIRST always hidden)")
-    p.add_argument("--prune-cache", action="store_true", help="Archive stale cache entries (older than 30 days)")
+    p.add_argument("--prune-cache", action="store_true", help="Archive stale cache entries and trim archive to 1 year")
     p.add_argument("--calendar", type=str, default=None, const="current", nargs="?", metavar="MONTH YEAR", help="Show price calendar for a month (e.g. 'Aug 2026', default: current month)")
     p.add_argument("--trends", action="store_true", help="Show price trend analysis from collected data")
     p.add_argument("--origin", "-o", type=str, default=None, metavar="CODE", help="Origin airport IATA (default: OSL)")
     p.add_argument("--destination", "-d", type=str, default=None, metavar="CODE", help="Destination airport IATA (default: BKK)")
-    p.add_argument("--depart", type=str, default=None, metavar="YYYY-MM-DD", help="Departure date (default: 2026-08-17)")
-    p.add_argument("--ret", type=str, default=None, metavar="YYYY-MM-DD", help="Return date (default: 2026-09-04)")
-    return p.parse_args(argv)
+    p.add_argument("--depart", type=str, default=None, metavar="YYYY-MM-DD", help="Departure date (default: today + 30 days)")
+    p.add_argument("--ret", type=str, default=None, metavar="YYYY-MM-DD", help="Return date (default: departure + 18 days)")
+    args = p.parse_args(argv)
+    if args.json and (args.drift is not None or args.drift_ret is not None):
+        p.error("--json cannot be combined with --drift or --drift-ret")
+    return args
 
 
 # ============================================================
@@ -2171,7 +2684,18 @@ def parse_args(argv=None):
 # ============================================================
 
 
-def _scan_dates(headers, cookies, args, max_price, weight, max_dur, top_n, raw, direction):
+def _scan_dates(
+    headers,
+    cookies,
+    args,
+    max_price,
+    weight,
+    max_dur,
+    top_n,
+    raw,
+    direction,
+    stats=None,
+):
     if direction == "OB":
         base = datetime.strptime(SEARCH["departure_date"], "%Y-%m-%d").date()
         fixed = datetime.strptime(SEARCH["return_date"], "%Y-%m-%d").date()
@@ -2204,7 +2728,18 @@ def _scan_dates(headers, cookies, args, max_price, weight, max_dur, top_n, raw, 
             log.print(f"[cyan]{label} request {idx+1}/{total}: {d}[/cyan]")
             dep_date = date_str if direction == "OB" else fixed.isoformat()
             ret_date = fixed.isoformat() if direction == "OB" else date_str
-            results = _fetch_and_parse(headers, cookies, origin, dest, date_str, dep_date, ret_date, direction, max_dur)
+            results = _fetch_and_parse(
+                headers,
+                cookies,
+                origin,
+                dest,
+                date_str,
+                dep_date,
+                ret_date,
+                direction,
+                max_dur,
+                stats=stats,
+            )
             all_results.extend(results)
     except (EdgeBlock, AppAuthError, RateLimited, BudgetExceeded) as exc:
         aborted = exc
@@ -2229,12 +2764,54 @@ def _scan_dates(headers, cookies, args, max_price, weight, max_dur, top_n, raw, 
     return final
 
 
-def scan_outbound(headers, cookies, args, max_price, weight, max_dur, top_n, raw=False):
-    return _scan_dates(headers, cookies, args, max_price, weight, max_dur, top_n, raw, "OB")
+def scan_outbound(
+    headers,
+    cookies,
+    args,
+    max_price,
+    weight,
+    max_dur,
+    top_n,
+    raw=False,
+    stats=None,
+):
+    return _scan_dates(
+        headers,
+        cookies,
+        args,
+        max_price,
+        weight,
+        max_dur,
+        top_n,
+        raw,
+        "OB",
+        stats=stats,
+    )
 
 
-def scan_return(headers, cookies, args, max_price, weight, max_dur, top_n, raw=False):
-    return _scan_dates(headers, cookies, args, max_price, weight, max_dur, top_n, raw, "RB")
+def scan_return(
+    headers,
+    cookies,
+    args,
+    max_price,
+    weight,
+    max_dur,
+    top_n,
+    raw=False,
+    stats=None,
+):
+    return _scan_dates(
+        headers,
+        cookies,
+        args,
+        max_price,
+        weight,
+        max_dur,
+        top_n,
+        raw,
+        "RB",
+        stats=stats,
+    )
 
 
 # ============================================================
@@ -2242,7 +2819,7 @@ def scan_return(headers, cookies, args, max_price, weight, max_dur, top_n, raw=F
 # ============================================================
 
 
-def drift_scan(headers, cookies, args, max_price, max_dur):
+def drift_scan(headers, cookies, args, max_price, max_dur, stats=None):
     base_ob = datetime.strptime(SEARCH["departure_date"], "%Y-%m-%d").date()
     base_rb = datetime.strptime(SEARCH["return_date"], "%Y-%m-%d").date()
     trip_days = (base_rb - base_ob).days
@@ -2262,10 +2839,32 @@ def drift_scan(headers, cookies, args, max_price, max_dur):
             rb_str = rb_date.isoformat()
             log.print(f"[cyan]Drift {idx+1}/{total}: {ob_date} \u2192 {rb_date} ({trip_days}d trip)[/cyan]")
 
-            results = _fetch_and_parse(headers, cookies, SEARCH["origin"], SEARCH["destination"], ob_str, ob_str, rb_str, "OB", max_dur)
+            results = _fetch_and_parse(
+                headers,
+                cookies,
+                SEARCH["origin"],
+                SEARCH["destination"],
+                ob_str,
+                ob_str,
+                rb_str,
+                "OB",
+                max_dur,
+                stats=stats,
+            )
             all_results.extend(results)
 
-            results = _fetch_and_parse(headers, cookies, SEARCH["destination"], SEARCH["origin"], rb_str, ob_str, rb_str, "RB", max_dur)
+            results = _fetch_and_parse(
+                headers,
+                cookies,
+                SEARCH["destination"],
+                SEARCH["origin"],
+                rb_str,
+                ob_str,
+                rb_str,
+                "RB",
+                max_dur,
+                stats=stats,
+            )
             all_results.extend(results)
     except (EdgeBlock, AppAuthError, RateLimited, BudgetExceeded) as exc:
         aborted = exc
@@ -2292,7 +2891,7 @@ def drift_scan(headers, cookies, args, max_price, max_dur):
     return final
 
 
-def drift_scan_return(headers, cookies, args, max_price, max_dur):
+def drift_scan_return(headers, cookies, args, max_price, max_dur, stats=None):
     base_ob = datetime.strptime(SEARCH["departure_date"], "%Y-%m-%d").date()
     base_rb = datetime.strptime(SEARCH["return_date"], "%Y-%m-%d").date()
     drift = args.drift_ret
@@ -2321,10 +2920,32 @@ def drift_scan_return(headers, cookies, args, max_price, max_dur):
 
             log.print(f"[cyan]Drift-Ret {idx+1}/{total}: {ob_date} \u2192 {rb_date} ({trip_days}d trip)[/cyan]")
 
-            results = _fetch_and_parse(headers, cookies, SEARCH["origin"], SEARCH["destination"], ob_str, ob_str, rb_str, "OB", max_dur)
+            results = _fetch_and_parse(
+                headers,
+                cookies,
+                SEARCH["origin"],
+                SEARCH["destination"],
+                ob_str,
+                ob_str,
+                rb_str,
+                "OB",
+                max_dur,
+                stats=stats,
+            )
             all_results.extend(results)
 
-            results = _fetch_and_parse(headers, cookies, SEARCH["destination"], SEARCH["origin"], rb_str, ob_str, rb_str, "RB", max_dur)
+            results = _fetch_and_parse(
+                headers,
+                cookies,
+                SEARCH["destination"],
+                SEARCH["origin"],
+                rb_str,
+                ob_str,
+                rb_str,
+                "RB",
+                max_dur,
+                stats=stats,
+            )
             all_results.extend(results)
     except (EdgeBlock, AppAuthError, RateLimited, BudgetExceeded) as exc:
         aborted = exc
@@ -2367,7 +2988,7 @@ def print_drift_pair_table(results, title=None, filter_note=None):
         console.print("[yellow]No results found.[/yellow]")
         return
 
-    table = Table(title=title, box=SIMPLE_HEAVY, header_style="bold cyan")
+    table = Table(title=_lit(title), box=SIMPLE_HEAVY, header_style="bold cyan")
     table.add_column("Date Pair", style="white")
     table.add_column("OB Econ", style="cyan")
     table.add_column("OB Biz", style="magenta")
@@ -2407,19 +3028,19 @@ def print_drift_pair_table(results, title=None, filter_note=None):
 
     for key in sorted(pairs.keys()):
         p = pairs[key]
-        date_label = f"{p['dep']} \u2192 {p['ret']}"
+        date_label = f"{_lit(p['dep'])} \u2192 {_lit(p['ret'])}"
         table.add_row(
             date_label,
-            cell_text(best_offer(p["offers"], "OB", "ECONOMY")),
-            cell_text(best_offer(p["offers"], "OB", "BUSINESS")),
-            cell_text(best_offer(p["offers"], "RB", "ECONOMY")),
-            cell_text(best_offer(p["offers"], "RB", "BUSINESS")),
+            _lit(cell_text(best_offer(p["offers"], "OB", "ECONOMY"))),
+            _lit(cell_text(best_offer(p["offers"], "OB", "BUSINESS"))),
+            _lit(cell_text(best_offer(p["offers"], "RB", "ECONOMY"))),
+            _lit(cell_text(best_offer(p["offers"], "RB", "BUSINESS"))),
         )
 
     console.print(table)
     console.print(FARE_LEGEND, style="white")
     if filter_note:
-        console.print(filter_note, style="dim white")
+        console.print(_lit(filter_note), style="dim white")
 
 
 # ============================================================
@@ -2524,7 +3145,14 @@ def print_mixed_table(combos):
                 ob_str += f" {c['biz_layout']}"
             else:
                 rb_str += f" {c['biz_layout']}"
-        table.add_row(str(i), c["label"], c["pair"], ob_str, rb_str, str(c["total"]))
+        table.add_row(
+            _lit(i),
+            _lit(c["label"]),
+            _lit(c["pair"]),
+            _lit(ob_str),
+            _lit(rb_str),
+            _lit(c["total"]),
+        )
     console.print(table)
     console.print(FARE_LEGEND, style="white")
 
@@ -2544,15 +3172,15 @@ def print_drift_summary(merged_results):
         best_dr = min(cabin_rows, key=lambda r: r["duration_seconds"] or 999999)
 
         def line(label, *parts):
-            p = "  ".join(str(x) for x in parts if x)
-            console.print(f"  {label:<14} {p}")
+            p = "  ".join(_lit(x) for x in parts if x)
+            console.print(f"  {_lit(label):<14} {p}")
 
         def worst_layout_rank(segments):
             return min(LAYOUT_RANK.get(s.get("layout", "Unknown"), 0) for s in segments)
 
         best_layout_row = max(cabin_rows, key=lambda r: worst_layout_rank(r.get("segments", [])))
 
-        console.print(f"\n[bold]{cabin} — Best of Drift:[/bold]")
+        console.print(f"\n[bold]{_lit(cabin)} \u2014 Best of Drift:[/bold]")
         if best_fare:
             s = "*" if best_fare.get("_converted") else ""
             c = FARE_SHORT.get(best_fare["fare"], best_fare["fare"])
@@ -2562,22 +3190,33 @@ def print_drift_summary(merged_results):
         line("Best layout:", layouts_str, best_layout_row["departure_date"], f"{best_layout_row['origin']}\u2192{best_layout_row['destination']}", best_layout_row["duration"])
 
         if best_fare:
-            url = booking_url(best_br["origin"], best_br["destination"], best_br.get("_dep_date", best_br["departure_date"]), best_br.get("_ret_date", best_br["departure_date"]), cabin)
-            console.print(f"  {'Book:':<14} {url}")
+            dep = best_br.get("_dep_date") or best_br.get("departure_date")
+            ret = best_br.get("_ret_date") or best_br.get("departure_date")
+            url = booking_url(
+                SEARCH["origin"], SEARCH["destination"], dep, ret, cabin
+            )
+            console.print(f"  {'Book:':<14} {_lit(url)}")
 
 
-def print_booking_links(results):
+def print_booking_links(results, to_stderr=False):
+    out = log if to_stderr else console
     pairs = set()
     for r in results:
         dep = r.get("_dep_date") or r.get("departure_date")
         ret = r.get("_ret_date")
         if dep and ret:
-            pairs.add((r["origin"], r["destination"], dep, ret))
+            pairs.add((dep, ret))
     if pairs:
-        console.print("\n[bold]Booking links:[/bold]")
-        for origin, dest, dep, ret in sorted(pairs):
-            url = booking_url(origin, dest, dep, ret, "ECONOMY")
-            console.print(f"  {dep} \u2192 {ret}  {url}")
+        out.print("\n[bold]Booking links:[/bold]")
+        for dep, ret in sorted(pairs):
+            url = booking_url(
+                SEARCH["origin"],
+                SEARCH["destination"],
+                dep,
+                ret,
+                "ECONOMY",
+            )
+            out.print(f"  {_lit(dep)} \u2192 {_lit(ret)}  {_lit(url)}")
 
 
 # ============================================================
@@ -2598,7 +3237,7 @@ def _main():
     SCAN["max_retries"] = max(0, min(1, args.max_retries))
     configure_rate_limiter(
         base_delay=args.delay if args.delay is not None else SCAN["delay_seconds"],
-        budget=args.budget,
+        budget=None if args.budget in (None, 0) else args.budget,
         force=args.force,
     )
 
@@ -2614,37 +3253,22 @@ def _main():
                 "[yellow]Ignoring active cooldown (--force); it remains on disk.[/yellow]"
             )
 
-    # -- paste mode
+    cfg = None
     if args.paste:
         cfg = prompt_paste_headers()
-    else:
-        cfg = load_config()
-        if cfg is None:
-            log.print(
-                "[yellow]No saved config found. Run with --paste to set up headers.[/yellow]"
-            )
-            sys.exit(1)
 
     if args.price_map:
         print_price_map()
         return
 
-    headers = cfg.get("headers", {})
-    cookies = cfg.get("cookies", {})
-
-    set_nocache(args.nocache)
-
-    # Cache archival (auto on every run)
-    archived = archive_stale_cache()
-    if archived:
-        log.print(f"[dim]Archived {archived} stale entries, archive trimmed to {ARCHIVE_MAX_DAYS}d[/dim]")
-
-    # --prune-cache: manual archive trigger
     if args.prune_cache:
-        log.print(f"[green]Pruned: {archived} entries archived, archive \u2264 {ARCHIVE_MAX_DAYS}d[/green]")
+        archived = archive_stale_cache()
+        log.print(
+            f"[green]Pruned: {archived} entries archived, "
+            f"archive \u2264 {ARCHIVE_MAX_DAYS}d[/green]"
+        )
         return
 
-    # --calendar / --trends: analytics mode (can combine both)
     if args.calendar or args.trends:
         archive_prices = _load_archive_prices()
         if args.calendar:
@@ -2658,18 +3282,35 @@ def _main():
             print_price_trends(SEARCH["origin"], SEARCH["destination"], archive_prices=archive_prices)
         return
 
+    if cfg is None:
+        cfg = load_config()
+        if cfg is None:
+            log.print(
+                "[yellow]No saved config found. Run with --paste to set up headers.[/yellow]"
+            )
+            sys.exit(1)
+
     if not validate_config(cfg):
         sys.exit(1)
+
+    headers = cfg.get("headers") or {}
+    cookies = cfg.get("cookies") or {}
+
+    set_nocache(args.nocache)
+
+    # Cache archival (auto on every live run)
+    archived = archive_stale_cache()
+    if archived:
+        log.print(f"[dim]Archived {archived} stale entries, archive trimmed to {ARCHIVE_MAX_DAYS}d[/dim]")
 
     # CLI overrides for search params
     if args.origin:
         SEARCH["origin"] = args.origin.upper()
     if args.destination:
         SEARCH["destination"] = args.destination.upper()
-    if args.depart:
-        SEARCH["departure_date"] = args.depart
-    if args.ret:
-        SEARCH["return_date"] = args.ret
+    SEARCH["departure_date"], SEARCH["return_date"] = _resolve_search_dates(
+        args.depart, args.ret
+    )
     # Validate dates
     try:
         ob_date = datetime.strptime(SEARCH["departure_date"], "%Y-%m-%d")
@@ -2683,11 +3324,10 @@ def _main():
 
     # parse --max-price override e.g. "ECONOMY=8000,BUSINESS=14000"
     max_price = dict(SCAN["max_price"])
-    if args.max_price:
-        for part in args.max_price.split(","):
-            if "=" in part:
-                cabin, val = part.split("=", 1)
-                max_price[cabin.strip()] = int(val.strip())
+    if isinstance(args.max_price, str):
+        max_price.update(_parse_max_price(args.max_price))
+    elif args.max_price:
+        max_price.update(args.max_price)
 
     # --all-fares: include lite/elite fare types
     if args.all_fares:
@@ -2737,13 +3377,16 @@ def _main():
         else:
             print_compare_table(merge_cabins(results), title=ob_label, filter_note=filter_note)
         if args.urls and results:
-            print_booking_links(results)
+            print_booking_links(results, to_stderr=args.json)
 
     if args.drift is not None:
         log.rule("[bold cyan]Drift scan[/bold cyan]")
         aborted = None
+        stats = {"calls": 0, "failures": 0}
         try:
-            all_results = drift_scan(headers, cookies, args, max_price, max_dur)
+            all_results = drift_scan(
+                headers, cookies, args, max_price, max_dur, stats=stats
+            )
         except ScanAborted as e:
             all_results = e.results
             aborted = e
@@ -2762,13 +3405,18 @@ def _main():
         if aborted is not None:
             _log_error(_abort_message(aborted))
             sys.exit(1)
+        if _report_scan_failures(stats) == "all_failed":
+            sys.exit(1)
         if not all_results:
             return
     elif args.drift_ret is not None:
         log.rule("[bold cyan]Drift-Ret scan[/bold cyan]")
         aborted = None
+        stats = {"calls": 0, "failures": 0}
         try:
-            all_results = drift_scan_return(headers, cookies, args, max_price, max_dur)
+            all_results = drift_scan_return(
+                headers, cookies, args, max_price, max_dur, stats=stats
+            )
         except ScanAborted as e:
             all_results = e.results
             aborted = e
@@ -2787,6 +3435,8 @@ def _main():
         if aborted is not None:
             _log_error(_abort_message(aborted))
             sys.exit(1)
+        if _report_scan_failures(stats) == "all_failed":
+            sys.exit(1)
         if not all_results:
             return
     elif in_scan_mode:
@@ -2795,15 +3445,36 @@ def _main():
 
         all_results = []
         aborted = None
+        stats = {"calls": 0, "failures": 0}
         try:
             if scan_ob:
                 log.rule("[bold cyan]Scanning outbound dates[/bold cyan]")
-                top = scan_outbound(headers, cookies, args, max_price, weight, max_dur, top_n, raw=True)
+                top = scan_outbound(
+                    headers,
+                    cookies,
+                    args,
+                    max_price,
+                    weight,
+                    max_dur,
+                    top_n,
+                    raw=True,
+                    stats=stats,
+                )
                 all_results.extend(top)
 
             if scan_rb:
                 log.rule("[bold cyan]Scanning return dates[/bold cyan]")
-                top = scan_return(headers, cookies, args, max_price, weight, max_dur, top_n, raw=True)
+                top = scan_return(
+                    headers,
+                    cookies,
+                    args,
+                    max_price,
+                    weight,
+                    max_dur,
+                    top_n,
+                    raw=True,
+                    stats=stats,
+                )
                 all_results.extend(top)
         except ScanAborted as e:
             all_results.extend(e.results)
@@ -2822,13 +3493,19 @@ def _main():
                 f" (max {max_dur}h, max price: {max_price})"
             )
             display(all_results, title=label)
-        elif aborted is None:
-            log.print("[yellow]No results after scan + filtering.[/yellow]")
-            return
+            if args.urls and all_results:
+                print_booking_links(all_results, to_stderr=args.json)
 
         if aborted is not None:
             _log_error(_abort_message(aborted))
             sys.exit(1)
+
+        if _report_scan_failures(stats) == "all_failed":
+            sys.exit(1)
+
+        if not all_results:
+            log.print("[yellow]No results after scan + filtering.[/yellow]")
+            return
     else:
         # --- Outbound call ---
         log.print(
@@ -2898,16 +3575,19 @@ def _main():
             _log_error(_abort_message(aborted))
             sys.exit(1)
         except RequestFailed as e:
+            update_price_map(ob_results)
             display_outbound_partial(ob_results)
             _log_error(f"Return: {e}")
             sys.exit(1)
         if rb_data is None:
+            update_price_map(ob_results)
             display_outbound_partial(ob_results)
             _log_error(f"Return HTTP {rb_status}: {rb_err}")
             sys.exit(1)
         try:
             rb_results = parse_results(rb_data, max_dur)
         except RequestFailed as e:
+            update_price_map(ob_results)
             display_outbound_partial(ob_results)
             _log_error(f"Return: {e}")
             sys.exit(1)
@@ -2932,7 +3612,7 @@ def _main():
             print_compare_table(rb_merged, title=rb_label, filter_note=filter_note)
 
         if args.urls:
-            print_booking_links(ob_results + rb_results)
+            print_booking_links(ob_results + rb_results, to_stderr=args.json)
 
 
 if __name__ == "__main__":

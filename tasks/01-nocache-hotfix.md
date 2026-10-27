@@ -23,7 +23,8 @@ Only `fetch_flights()` in `flights.py`. No behavior change for the cached path.
    - Do **not** initialize `cache = {}`: `save_offers_cache()` writes the whole dict, so an
      empty dict would erase previously cached dates.
 2. Preserve intended semantics:
-   - `_nocache` **skips reading** the cache.
+   - The cache is **always loaded at function entry** so a successful `_nocache` fetch can
+     merge into existing entries. `_nocache` skips only the **cache-hit check**, not the load.
    - A successful response **still writes** to the cache (the `cache[key] = ...` /
      `save_offers_cache(cache)` path in `fetch_flights()`).
 3. Keep the return contract `(data, status, error)` and the cache key format

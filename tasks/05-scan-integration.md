@@ -104,6 +104,10 @@ README, tests, and status docs. No new endpoint or payload.
   - For `status == 0`, use `"Network error: <summary>"` rather than `"HTTP 0"`.
 - Add `import re` and `from rich.markup import escape`.
 
+> Clarified by T13: the shipped bounds are an 8K scan prefix (`BODY_SCAN_LIMIT`), a 300-char
+> summary (`BODY_SUMMARY_LIMIT`), and a 16K reference scan (`EDGE_REFERENCE_LIMIT`); the
+> original 200-char/unbounded wording above is historical.
+
 ### 3. Transient retries and `_fetch_and_parse()`
 
 - Add `SCAN["max_retries"] = 0`; `main()` sets it from the CLI (0 or 1).

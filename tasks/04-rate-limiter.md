@@ -57,6 +57,12 @@ still present (the extra delay is harmless until T05 removes them).
      `{"live_calls": [], "blocked_until": None}`. Do not move/delete corrupt files; just
      overwrite them on the next write.
    - Ignore unknown keys when reading; write only the two known keys.
+
+   > Clarified by T11: corrupt/unreadable rate state is now fail-closed (live calls are refused
+   > even with `--force`) instead of being silently treated as empty; `--clear-block` rewrites
+   > a clean state. `record_block()` will not shorten an existing later `blocked_until`, and a
+   > block-recording failure cannot mask the original abort. The historical T04 log below is
+   > preserved as written.
 2. **Constants and imports**
    - Add `import fcntl`, `import random`, and `math` (or equivalent) at the top.
    - Import `timezone` from `datetime`.

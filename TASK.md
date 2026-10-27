@@ -1,12 +1,15 @@
 # TASK: Restore reliable `flight-offers` scanning (Akamai 403 mitigation)
 
-Status: Phase 1 implemented through T05, T09, T10, T11 (2026-10-26); post-review remediation T12–T14 pending, then T06 verification
+Status: Phase 1 implemented through T05 and T09–T15 (2026-10-26); T14 docs/test cleanup Done; T06 verification pending
 Owner: (unassigned)
 Related: `flights.py`, `config.json`, `api.md`, `README.md`
 Execution tasks: `tasks/` (index in `task-data.md` §0)
 Deferred research: `TASK_FARE_CALENDAR.md`
 
 ## Revision history
+
+Counts and line references in this history are historical snapshots, not the current suite
+size; each entry records the suite at that point in time.
 
 - 2026-10-25 — initial draft from the 403 analysis.
 - 2026-10-25 — separated the two failure gates (identity validity vs. call budget), added
@@ -31,6 +34,30 @@ Deferred research: `TASK_FARE_CALENDAR.md`
   corrupt/unreadable state fails closed (even with `--force`), abort-path block writes no
   longer mask the original error, and `--clear-block` recovers unusable state. Full suite
   passes (115 tests).
+- 2026-10-26 — T12 CLI/output/local-mode correctness shipped: literal Rich rendering and
+  valid JSON, stderr links under `--json`, scan `--urls`, config-free local modes, transient
+  failure exit accounting, return-failure price-map updates, and typed CLI validation. Full
+  suite passes (155 tests).
+- 2026-10-26 — T13 request/config/cookie hardening shipped: forbidden headers are re-filtered
+  at send time, config writes are atomic/locked and non-destructive, corrupt config is
+  quarantined with automatic cookie persistence skipped, `_abck` invalid/unknown/stale states
+  warn with a `--paste` hint, and error-body summaries/reference extraction are bounded. Full
+  suite passes (175 tests).
+- 2026-10-26 — T14/T06 review found residual behavior gaps outside docs/test-contract scope:
+  repeated FX fetches in local views, schema-unsafe nested JSON, malformed-payload caching,
+  return-link dates, and weak numeric/default-date validation. Added required T15 to fix them
+  before T14's final docs/test sweep and T06 sign-off. No runtime code changed in this review.
+- 2026-10-26 — T15 residual-state/output correctness shipped: stale FX fallback is memoized
+  per currency per run, persisted/source JSON is schema-guarded, malformed 200 payloads are
+  not cached, booking links always use the search route plus pair dates, and numeric flags
+  plus rolling default dates are validated. Full suite passes (200 tests).
+- 2026-10-26 — T14 docs/test-contract cleanup completed: README paste format/flags/defaults
+  and state-recovery notes match the code; TASK/task-data/task logs are reconciled with
+  T09–T15; added a non-JSON 200 main-level test and T05 retry limiter-accounting tests,
+  without duplicating T15/T03 coverage. Full suite passes (203 tests). T06 remains pending.
+- 2026-10-26 — test suite consolidated from 203 to 115 tests by merging overlapping cases
+  into parameterized/subTest groups; no behavior area was dropped. Full suite passes
+  (115 tests). T06 remains pending.
 
 ---
 
@@ -272,7 +299,7 @@ needed.
 | 7 | On non-200 the scan continues to the next date; no abort/backoff | `fetch_flights()`, `_scan_dates()` | **Fixed (T05)** |
 | 8 | Raw Akamai HTML dumped into the console | `_fetch_and_parse()` | **Fixed (T05)** |
 | 9 | **Bug:** `--nocache` + successful fetch crashed | `fetch_flights()` | **Fixed (T01)** |
-| 10 | No surfacing of `_abck` validation state | `parse_pasted_headers()` | **Partially fixed (T02); T13** |
+| 10 | No surfacing of `_abck` validation state | `parse_pasted_headers()` / `validate_config()` | **Fixed (T13)** |
 | 11 | No cross-run throttle / persisted request budget | scan loops | **Fixed (T04)** |
 | 12 | Fixed 20s spacing too aggressive | `SCAN` | **Fixed (T04)** |
 | 13 | Request budget never calibrated | — | T06 |
@@ -284,14 +311,15 @@ needed.
 
 | Task | Finding | Severity |
 |------|---------|----------|
-| T09 | Non-JSON/malformed 200s and unsafe FX/price conversion | High |
-| T10 | Non-atomic/unguarded offers cache, archive, price map, currency writes | High |
+| T09 | Non-JSON/malformed 200s and unsafe FX/price conversion | Done (2026-10-26) |
+| T10 | Non-atomic/unguarded offers cache, archive, price map, currency writes | Done (2026-10-26) |
 | T11 | Cooldown race, fail-open corrupt state, abort-masking block writes | Done (2026-10-26) |
-| T12 | Rich-markup JSON corruption, `--urls`/JSON conflicts, local-mode/config and exit-code bugs | Medium |
-| T13 | Header policy not enforced at send time; config/cookie fragility; incomplete `_abck` warning; unbounded error bodies | Medium |
-| T14 | README/TASK/task-data contradictions and remaining regression-test gaps | Medium |
+| T12 | Rich-markup JSON corruption, `--urls`/JSON conflicts, local-mode/config and exit-code bugs | Done (2026-10-26) |
+| T13 | Header policy not enforced at send time; config/cookie fragility; incomplete `_abck` warning; unbounded error bodies | Done (2026-10-26) |
+| T14 | README/TASK/task-data contradictions and remaining regression-test gaps | Done (2026-10-26) |
+| T15 | FX retry storms, schema-unsafe JSON, malformed-payload caching, return-link dates, CLI/default-date validation | Done (2026-10-26) |
 
-T09–T11 fixed (2026-10-26); T12–T14 remain.
+T09–T15 fixed or closed (2026-10-26); T06 verification remains pending.
 
 Historical note: issue 9 was fixed in T01; the `--nocache` diagnostic path remains covered by
 `tests/test_nocache.py`.
@@ -341,11 +369,14 @@ POST https://www.qatarairways.com/dapi/public/bff/web/flight-search/flight-offer
 - App/auth essentials: `Content-Type: application/json`, `nbx_fs_api_key`, `session-id`,
   `X-AssignedDeviceID`, `Origin`, `Referer`, plus cookies.
 - Browser-like (to pass Akamai): UA matching TLS, `Accept`, `Accept-Language: en`,
-  `Accept-Encoding`, `Sec-Fetch-Dest/Mode/Site`, `Pragma`, `Cache-Control`.
+  `Sec-Fetch-Dest/Mode/Site`, `Pragma`, `Cache-Control`.
 - Safe to drop: marketing/analytics cookies (`_ga*`, `AMCV*`, `OptanonConsent`, `s_*`,
   `mbox`, `_fbp`, `_gcl_au`, `kndctr_*`, `FPID`, `FPLC`).
 - Must keep/echo: `_abck`, `bm_sz`, `bm_sv`, `ak_bmsc`, `BIGipServer*`, `AKA_A2`,
   `TS01753a24`/`TS01163f70`.
+- Do **not** send a stored `Accept-Encoding` from the pasted config. Plain `requests` keeps
+  its own library default, and `_sanitize_headers()` drops stored `Accept-Encoding` at send
+  time (only send `br`/`zstd` if the decoders are installed, or use `curl_cffi`).
 - Do not copy `Host` or `Content-Length`; `requests` computes them.
 
 > Deferred calendar research: see `TASK_FARE_CALENDAR.md`.
@@ -380,7 +411,8 @@ session-scoped or time-scoped. Encode these in `SCAN` config.
 
 ### Phase 1.0 — Header provenance & validation (hardening)
 1. Parse the request line (`POST /dapi/public/bff/web/flight-search/flight-offers HTTP/2`)
-   and the `Host`. Currently ignored (`flights.py:158-191`).
+   and the `Host` in the paste parser (`parse_pasted_headers()` /
+   `prompt_paste_headers()`), which previously ignored them.
 2. Accept only QR `flight-offers` requests; reject other hosts/paths with a clear error
    ("Paste headers from a qatarairways.com flight-search request").
 3. Require `session-id`, `X-AssignedDeviceID`, `nbx_fs_api_key`. Warn (don't fail) if the
@@ -406,9 +438,9 @@ session-scoped or time-scoped. Encode these in `SCAN` config.
    the actual requested leg dates).
 5. Add jittered delays, a **persisted rate limiter**, and **abort on 403**:
    - base delay = **45s**, jittered per call (~40–55s, e.g. `random.randint(40, 55)`)
-   - **no hard per-run cap initially** — 45s spacing is the primary control and
-     abort-on-403 is the hard stop. After Phase 0.5, add an optional `--budget` safety cap
-     only if the measured limit warrants it
+   - **per-run budget** — `--budget N` is shipped and defaults to off/unlimited (`0` means
+     unlimited). Failed/timed-out POSTs count; cache hits do not. 45s spacing and
+     abort-on-403 remain the primary controls, and T06 may calibrate a recommended cap.
    - `.rate_state.json` stores **UTC ISO timestamps** of live calls plus a `blocked_until`
      timestamp; use `fcntl.flock` to serialize and prune old entries
    - enforce the minimum spacing **across process runs**; cache hits do **not** count
@@ -454,7 +486,8 @@ session-scoped or time-scoped. Encode these in `SCAN` config.
 }
 ```
 
-Add `.rate_state.json` to `.gitignore` (local data).
+`impersonate` is a T07-only optional field for the unshipped `curl_cffi` backend; current
+code neither reads nor writes it. Add `.rate_state.json` to `.gitignore` (local data).
 
 ### 8.2 New / changed functions
 - `parse_pasted_headers()` — stop hardcoding UA; preserve the pasted UA and browser headers;
@@ -462,10 +495,11 @@ Add `.rate_state.json` to `.gitignore` (local data).
 - `make_trace_headers()` — fresh shared trace/span pair formatted as `Request-Id` and
   `traceparent`.
 - `build_referer(origin, destination, depart, ret)` — date-accurate.
-- `HttpClient` — holds a `Session`, applies headers, regenerates trace headers,
-  injects/updates cookies, returns `(status, json|text)`.
-- `fetch_flights()` — use `HttpClient`; fix the `cache` initialization bug; on 403 return a
-  typed error.
+- `HttpClient` — holds a `Session`, applies headers, regenerates trace headers, injects/updates
+  cookies, and returns a `requests.Response` from `post_offers()`.
+- `fetch_flights()` — use `HttpClient`; fix the `cache` initialization bug; on a classified
+  failure raise the typed errors (`EdgeBlock`, `AppAuthError`, `RequestFailed`,
+  `RateLimited`, `BudgetExceeded`), otherwise return `(data, status, error)`.
 - `_scan_dates()`, `drift_scan()`, `drift_scan_return()` — abort on block, preserve
   partials; pacing stays in `fetch_flights()`.
 - `classify_block(status, body)` — Akamai HTML vs app JSON error.
@@ -476,12 +510,13 @@ Add `.rate_state.json` to `.gitignore` (local data).
 - Abort-on-block is unconditional; do not add a disable flag.
 - Add `--max-retries {0,1}` (default 0) for transient 5xx/timeout failures only; never retry
   edge/auth/rate/budget.
-- Add `--budget` (optional live-call safety cap; default off until calibrated).
-- Add `--no-impersonate` to force the `requests` backend.
+- `--budget N` is shipped: default off/unlimited, non-negative, `0` = unlimited.
+- `--no-impersonate` is **T07-only optional/unshipped**; the current CLI does not define it.
 
 ### 8.4 Backward compatibility
-- Existing `config.json` without `user_agent`/`impersonate` still loads.
-- If `curl_cffi` is missing, behave exactly as today but warn once.
+- Existing `config.json` without `user_agent` loads.
+- `impersonate` is ignored today; it only becomes meaningful if optional T07 ships.
+- If `curl_cffi` is missing, behave exactly as today but warn once (T07 only).
 
 ---
 
@@ -493,8 +528,9 @@ rest of the run. Longer runs are acceptable — correctness beats speed.
 - **Base spacing = 45s**, with per-request jitter so the interval is not a fixed pattern.
   Example for 10 calls: `45, 40, 50, 43, 47, …` (~40–55s, `random.randint(40, 55)`).
 - **Live-call definition**: only network POSTs count; cache hits are free.
-- **Per-run budget**: no hard cap initially — 45s spacing + abort-on-403 are the controls.
-  After calibration, add an optional `--budget` safety cap only if needed.
+- **Per-run budget**: `--budget N` is shipped and defaults to off/unlimited (`0` = unlimited).
+  It caps live POST attempts per run; cache hits do not count. T06 may calibrate a recommended
+  cap from evidence.
 - **Cross-run throttle**: persist recent live-call timestamps and enforce the same spacing
   across back-to-back runs (`.rate_state.json`); lock the file or document single-instance
   use.
@@ -558,40 +594,65 @@ Record results in section 17.
 
 ## 12. Acceptance criteria
 
+Current shipped behavior (T05, T09–T15):
+
 - A single live `flight-offers` request succeeds immediately after `--paste` from a warm
   browser session.
 - Live calls are spaced at a **45s base with per-request jitter (~40–55s)**, never a fixed
   interval; a full scan may take several minutes.
 - Cross-run spacing is enforced via `.rate_state.json`; cache hits do not count as live
-  calls; an optional safety cap can be configured after calibration.
-- A scan either completes within the measured budget, or aborts cleanly with a clear,
-  actionable message (no raw HTML, no silent continuation, no retry storm).
-- The run aborts on the **first 403**; already-collected results are preserved and shown.
-- A **10-call scan at 45s jitter** is the target validation case.
-- Response `Set-Cookie` values are persisted and reused on the next call.
+  calls. `--budget N` is shipped and defaults to off/unlimited (`0` = unlimited).
+- A scan either completes, or aborts cleanly with a clear, actionable message (no raw HTML,
+  no silent continuation, no retry storm).
+- The run aborts on the **first 403** and on app auth/rate/budget errors; already-collected
+  results are preserved and shown. Partial transient failures are reported as
+  `N/M requests failed`; an all-transient run exits 1.
+- Response `Set-Cookie` values are persisted and reused on the next call; corrupt
+  `config.json` is quarantined and automatic cookie persistence is skipped.
 - `Request-Id`/`traceparent` rotate every request as a shared trace/span pair; date/timestamp
   fields always match the actual requested dates and current time.
-- `--nocache` works without crashing.
-- The `--paste` validator rejects blocks that are not QR `flight-offers` requests or that
-  lack the required auth headers (Phase 1.0).
+- `--nocache` works without crashing and still merges fresh results into the existing cache.
+- The `--paste` validator rejects request-line pastes that are not QR `flight-offers`
+  requests or that lack the required auth headers; headers-only pastes are accepted but
+  marked unverified.
+- Non-JSON or structurally malformed 200 payloads are typed transient failures: no cache or
+  price-map write, no cooldown, no traceback.
+- `--json` keeps stdout machine-readable and moves `--urls` links to stderr;
+  `--price-map`/`--prune-cache`/`--calendar`/`--trends` need no config; corrupt local state
+  fails closed with a clear message.
+- Invalid numeric flags exit 2; default dates are rolling (`today + 30` /
+  `departure + 18`), and stored `Accept-Encoding`/other forbidden transport headers are
+  dropped at send time.
+
+T06 owns the final verification matrix and any calibration result. The earlier phase-0.5
+targets (for example a 10-call scan at 45s jitter) remain calibration goals for T06, not
+unshipped features.
 
 ---
 
 ## 13. Test plan
 
-- Unit: `make_trace_headers()` returns a shared trace/span pair and both headers match.
-- Unit: `build_referer()` includes the correct dates; `parse_pasted_headers()` preserves UA
-  and Akamai cookies and validates provenance.
-- Unit: rate limiter enforces spacing, cross-run history, and `blocked_until` with a fake
-  clock; cache hits don't count.
-- Unit: abort-on-403 stops the loop and preserves earlier results.
-- Unit: `classify_block()` distinguishes Akamai HTML from JSON errors.
-- Unit: date/timestamp fields equal the requested dates and the current clock.
-- Unit: `fetch_flights()` cache path with `_nocache=True` and `False` (regression for
-  issue 9).
-- Integration (opt-in, real network): one live request; then a 10-call scan at 45s jitter.
+Automated coverage now lives in `tests/` (offline, temp paths/fakes) and is summarized in
+T06's verification matrix. Categories:
+
+- Unit: paste parsing/provenance, headers/cookies, config quarantine, and send-time header
+  filtering.
+- Unit: trace headers, date-accurate Referer, `HttpClient`/session cookie merge, and typed
+  HTTP errors.
+- Unit: rate limiter spacing, cross-run history, `blocked_until`, budget, corrupt state,
+  `--force`/`--clear-block`, and retry limiter accounting.
+- Unit: abort-on-block (edge/auth/rate/budget), partial results, and main-level exit codes.
+- Unit: cache load/merge/`--nocache`, malformed/non-JSON payload policy, archive pruning, and
+  atomic/quarantined persistence.
+- Unit: parsing/FX hardening, JSON stdout/`--urls` stderr separation, local-only modes, and
+  typed CLI/default-date validation.
+- Integration (T06, opt-in, real network with a fresh warm identity and explicit consent):
+  one live request, then a bounded 10-call scan at 45s jitter.
 - Regression: cached runs remain fast and produce identical output.
-- Error path: simulate 403 HTML and assert the run aborts with the friendly message.
+- Error path: simulated 403 HTML aborts with the friendly message.
+
+Historical note: this section originally described the pre-T09–T12 test plan; the bullets
+above are the shipped automated contract, and live calibration is bounded by T06.
 
 ---
 
@@ -689,7 +750,7 @@ Record results in section 17.
 
 - `task-data.md` — shared reference: headers, cookies, config, rate policy, error taxonomy,
   code map, test conventions.
-- `tasks/` — executable task documents (T01–T14); index in `task-data.md` §0.
+- `tasks/` — executable task documents (T01–T15); index in `task-data.md` §0.
 - `TASK_FARE_CALENDAR.md` — deferred `fare-calendars` research (price-only; not used).
 - `api.md` — flight-offers API reference.
 - `README.md` — user-facing flags and examples.

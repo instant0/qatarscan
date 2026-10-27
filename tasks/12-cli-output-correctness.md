@@ -1,7 +1,7 @@
 # T12 — CLI, output, and local-mode correctness
 
 - **Required**: Yes
-- **Status**: **Pending**
+- **Status**: **Done** (2026-10-26)
 - **Depends on**: T03, T05
 - **Blocks**: T06, T14
 - **Reference**: `../task-data.md` §8 (errors), §10 (code map), §11 (tests);
@@ -169,3 +169,26 @@ No live scans or network calls are required for T12.
 - Do not change the API payload or scan/abort semantics; this task is output/control-flow only.
 - New tests should use patches/temp files and must not touch the real `config.json`, cache, or
   rate-state files.
+
+## Execution log
+
+- Added literal-text rendering (`rich.markup.escape`) for API/data-derived values across table,
+  summary, link, price-map, calendar, and trend renderers; JSON renderers disable markup,
+  highlighting, and soft wrapping so long JSON stays valid. Compare-table fare strings are
+  built raw and escaped once at the row boundary, avoiding visible double-escape backslashes.
+- Kept JSON on stdout: booking links use the stderr console under `--json`; scan full/partial
+  output now honors `--urls`; scan and JSON conflict only remains for drift/drift-ret, which
+  `parse_args()` rejects with exit 2.
+- Moved local-only modes before config loading so price-map, prune-cache, calendar, and trends
+  run without `config.json`; paste and live searches still validate config. Prune calls
+  `archive_stale_cache()` itself; live auto-archive is unchanged.
+- Threaded per-run `{"calls", "failures"}` stats through scan/drift helpers and transient
+  failure paths. Mixed failures report `N/M`; all-transient runs exit 1 before the no-results
+  success path; cache hits and skipped dates stay successful/non-calls. Abort paths are
+  unchanged.
+- Non-scan return transient/no-data/parse failures now update the outbound price map exactly
+  once before exiting.
+- Added typed CLI validation for `--max-price`, `--budget` (0 = unlimited), and `--delay`
+  (positive), with argparse exit 2 on invalid values.
+- Updated README, added `tests/test_cli_output.py`, and updated status docs. Verification:
+  `py_compile` OK; `--help` exits 0; full suite 155 tests OK. No live scans or network calls.

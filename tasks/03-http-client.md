@@ -58,6 +58,10 @@ single-request call sites in `main()`. Do **not** implement abort-on-403 or rate
    - Read `CONFIG_FILE` directly (do not call `load_config()`; avoid its age warning), merge
      `{"cookies": cookies}`, call `save_config(cfg)`.
    - Tolerate a missing/corrupt config.
+
+   > Clarified by T13: the current implementation quarantines a corrupt `config.json`, warns,
+   > and skips automatic cookie persistence (it does not overwrite the corrupt file). A
+   > missing config still saves the new cookies. The original T03 log below is historical.
 7. **`fetch_flights(headers, cookies, origin, destination, departure_date, referer=None)`**
    - Keep the T01 cache behavior exactly (load once; `_nocache` skips the hit check).
    - If `referer` is None, fall back to `headers.get("Referer",

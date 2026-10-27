@@ -134,7 +134,7 @@ class ParsingTests(unittest.TestCase):
         self.assertEqual(result, [])
         log_error.assert_called_once()
 
-    def test_malformed_top_level_and_offer_list_raise(self):
+    def test_malformed_payloads_raise_and_empty_offers_are_valid(self):
         for payload in (
             None,
             [],
@@ -144,14 +144,14 @@ class ParsingTests(unittest.TestCase):
             {"flightOffers": {}},
             {"flightOffers": "bad"},
         ):
-            with self.assertRaises(flights.RequestFailed) as ctx:
-                flights.parse_results(payload)
-            self.assertEqual(ctx.exception.status, 200)
-            self.assertIn("Malformed flight-offers payload", str(ctx.exception))
-
-    def test_missing_or_empty_offers_is_valid_empty_result(self):
-        self.assertEqual(flights.parse_results({}), [])
-        self.assertEqual(flights.parse_results({"flightOffers": []}), [])
+            with self.subTest(payload=payload):
+                with self.assertRaises(flights.RequestFailed) as ctx:
+                    flights.parse_results(payload)
+                self.assertEqual(ctx.exception.status, 200)
+                self.assertIn("Malformed flight-offers payload", str(ctx.exception))
+        for payload in ({}, {"flightOffers": []}):
+            with self.subTest(valid_empty=payload):
+                self.assertEqual(flights.parse_results(payload), [])
 
     def test_valid_payload_is_preserved(self):
         output = flights.parse_results({"flightOffers": [self._offer()]})
@@ -223,11 +223,8 @@ class ParsingTests(unittest.TestCase):
         self.assertEqual(log_print.call_count, 1)
         self.assertIn("Skipped malformed", str(log_print.call_args))
 
-    def test_warn_false_suppresses_skip_warning(self):
         with patch.object(flights.log, "print") as log_print:
-            output = flights.parse_results(
-                {"flightOffers": ["bad"]}, warn=False
-            )
+            output = flights.parse_results({"flightOffers": ["bad"]}, warn=False)
         self.assertEqual(output, [])
         log_print.assert_not_called()
 

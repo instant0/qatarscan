@@ -67,37 +67,58 @@ class RateLimiterTests(unittest.TestCase):
             rng=self.rng,
         )
 
-    def test_jittered_spacing(self):
-        self.limiter.wait()
-        self.limiter.record_call()
-        self.sleep.calls = []
-        self.clock.advance(10)
-        self.limiter.wait()
-        self.limiter.record_call()
-        self.assertEqual(self.sleep.calls, [35.0])
-        self.sleep.calls = []
-        self.clock.advance(45)
-        self.limiter.wait()
-        self.limiter.record_call()
-        self.assertEqual(self.sleep.calls, [])
-
-    def test_cross_run_persisted_spacing(self):
-        self.limiter.wait()
-        self.limiter.record_call()
-        self.clock.advance(10)
-        limiter_b = flights.RateLimiter(
-            state_file=self.state_file,
-            lock_file=self.lock_file,
-            base_delay=45,
-            budget=None,
-            force=False,
-            clock=self.clock,
-            sleep=self.sleep,
-            rng=SequenceRng([45]),
-        )
-        limiter_b.wait()
-        self.assertEqual(self.sleep.calls, [35.0])
-        limiter_b.record_call()
+    def test_jittered_and_cross_run_spacing(self):
+        with self.subTest(kind="jitter"):
+            limiter = flights.RateLimiter(
+                state_file=os.path.join(self.tmp.name, "jitter.json"),
+                lock_file=os.path.join(self.tmp.name, "jitter.lock"),
+                base_delay=45,
+                budget=None,
+                force=False,
+                clock=self.clock,
+                sleep=self.sleep,
+                rng=SequenceRng([45, 45]),
+            )
+            limiter.wait()
+            limiter.record_call()
+            self.sleep.calls = []
+            self.clock.advance(10)
+            limiter.wait()
+            limiter.record_call()
+            self.assertEqual(self.sleep.calls, [35.0])
+            self.sleep.calls = []
+            self.clock.advance(45)
+            limiter.wait()
+            limiter.record_call()
+            self.assertEqual(self.sleep.calls, [])
+        with self.subTest(kind="cross-run"):
+            limiter_a = flights.RateLimiter(
+                state_file=os.path.join(self.tmp.name, "cross.json"),
+                lock_file=os.path.join(self.tmp.name, "cross.lock"),
+                base_delay=45,
+                budget=None,
+                force=False,
+                clock=self.clock,
+                sleep=self.sleep,
+                rng=SequenceRng([45, 45]),
+            )
+            limiter_a.wait()
+            limiter_a.record_call()
+            self.clock.advance(10)
+            limiter_b = flights.RateLimiter(
+                state_file=os.path.join(self.tmp.name, "cross.json"),
+                lock_file=os.path.join(self.tmp.name, "cross.lock"),
+                base_delay=45,
+                budget=None,
+                force=False,
+                clock=self.clock,
+                sleep=self.sleep,
+                rng=SequenceRng([45]),
+            )
+            self.sleep.calls = []
+            limiter_b.wait()
+            self.assertEqual(self.sleep.calls, [35.0])
+            limiter_b.record_call()
 
     def test_prunes_entries_older_than_24h(self):
         old = self.clock() - timedelta(hours=25)
@@ -113,52 +134,77 @@ class RateLimiterTests(unittest.TestCase):
         self.assertEqual(len(state["live_calls"]), 2)
         self.assertIn(recent.isoformat(), state["live_calls"][0])
 
-    def test_blocked_refusal_and_remaining_time(self):
-        blocked_until = self.clock() + timedelta(minutes=20)
-        with open(self.state_file, "w") as f:
-            json.dump(
-                {"live_calls": [], "blocked_until": blocked_until.isoformat()}, f
+    def test_block_force_and_clear(self):
+        with self.subTest(kind="blocked-refusal"):
+            state_file = os.path.join(self.tmp.name, "blocked.json")
+            blocked_until = self.clock() + timedelta(minutes=20)
+            with open(state_file, "w") as f:
+                json.dump(
+                    {"live_calls": [], "blocked_until": blocked_until.isoformat()},
+                    f,
+                )
+            sleep = ListSleep(self.clock)
+            limiter = flights.RateLimiter(
+                state_file=state_file,
+                lock_file=os.path.join(self.tmp.name, "blocked.lock"),
+                base_delay=45,
+                budget=None,
+                force=False,
+                clock=self.clock,
+                sleep=sleep,
+                rng=SequenceRng([45, 45]),
             )
-        with self.assertRaises(flights.RateLimited) as ctx:
-            self.limiter.wait()
-        self.assertGreater(ctx.exception.remaining_seconds, 0)
-        self.assertEqual(self.sleep.calls, [])
-
-    def test_force_bypasses_without_clearing(self):
-        blocked_until = self.clock() + timedelta(minutes=20)
-        with open(self.state_file, "w") as f:
-            json.dump(
-                {"live_calls": [], "blocked_until": blocked_until.isoformat()}, f
+            with self.assertRaises(flights.RateLimited) as ctx:
+                limiter.wait()
+            self.assertGreater(ctx.exception.remaining_seconds, 0)
+            self.assertEqual(sleep.calls, [])
+        with self.subTest(kind="force-bypass"):
+            state_file = os.path.join(self.tmp.name, "force.json")
+            blocked_until = self.clock() + timedelta(minutes=20)
+            with open(state_file, "w") as f:
+                json.dump(
+                    {"live_calls": [], "blocked_until": blocked_until.isoformat()},
+                    f,
+                )
+            limiter_force = flights.RateLimiter(
+                state_file=state_file,
+                lock_file=os.path.join(self.tmp.name, "force.lock"),
+                base_delay=45,
+                budget=None,
+                force=True,
+                clock=self.clock,
+                sleep=ListSleep(self.clock),
+                rng=SequenceRng([45, 45]),
             )
-        limiter_force = flights.RateLimiter(
-            state_file=self.state_file,
-            lock_file=self.lock_file,
-            base_delay=45,
-            budget=None,
-            force=True,
-            clock=self.clock,
-            sleep=self.sleep,
-            rng=self.rng,
-        )
-        limiter_force.wait()
-        with open(self.state_file) as f:
-            state = json.load(f)
-        self.assertEqual(state["blocked_until"], blocked_until.isoformat())
-
-    def test_record_block_and_clear_block(self):
-        self.limiter.record_block(minutes=20)
-        with open(self.state_file) as f:
-            state = json.load(f)
-        blocked = datetime.fromisoformat(state["blocked_until"])
-        self.assertAlmostEqual(
-            blocked.timestamp(),
-            (self.clock() + timedelta(minutes=20)).timestamp(),
-            delta=1,
-        )
-        self.limiter.clear_block()
-        with open(self.state_file) as f:
-            state = json.load(f)
-        self.assertIsNone(state["blocked_until"])
+            limiter_force.wait()
+            with open(state_file) as f:
+                state = json.load(f)
+            self.assertEqual(state["blocked_until"], blocked_until.isoformat())
+        with self.subTest(kind="record-and-clear"):
+            state_file = os.path.join(self.tmp.name, "record.json")
+            limiter = flights.RateLimiter(
+                state_file=state_file,
+                lock_file=os.path.join(self.tmp.name, "record.lock"),
+                base_delay=45,
+                budget=None,
+                force=False,
+                clock=self.clock,
+                sleep=ListSleep(self.clock),
+                rng=SequenceRng([45, 45]),
+            )
+            limiter.record_block(minutes=20)
+            with open(state_file) as f:
+                state = json.load(f)
+            blocked = datetime.fromisoformat(state["blocked_until"])
+            self.assertAlmostEqual(
+                blocked.timestamp(),
+                (self.clock() + timedelta(minutes=20)).timestamp(),
+                delta=1,
+            )
+            limiter.clear_block()
+            with open(state_file) as f:
+                state = json.load(f)
+            self.assertIsNone(state["blocked_until"])
 
     def test_budget_exhaustion(self):
         limiter_budget = flights.RateLimiter(
@@ -175,29 +221,6 @@ class RateLimiterTests(unittest.TestCase):
         limiter_budget.record_call()
         with self.assertRaises(flights.BudgetExceeded):
             limiter_budget.wait()
-
-    def test_corrupt_and_missing_state(self):
-        missing = flights.RateLimiter(
-            state_file=os.path.join(self.tmp.name, "missing.json"),
-            lock_file=os.path.join(self.tmp.name, "missing.lock"),
-            base_delay=45,
-            clock=self.clock,
-            sleep=self.sleep,
-            rng=SequenceRng([45]),
-        )
-        missing.wait()
-        missing.record_call()
-        with open(os.path.join(self.tmp.name, "missing.json")) as f:
-            state = json.load(f)
-        self.assertIn("live_calls", state)
-        self.assertIn("blocked_until", state)
-
-        with open(self.state_file, "w") as f:
-            f.write("{bad json")
-        with self.assertRaises(flights.RateLimited) as ctx:
-            self.limiter.wait()
-        self.assertTrue(getattr(ctx.exception, "state_error", False))
-        self.assertEqual(self.sleep.calls, [])
 
     def test_lock_serialized_concurrent_writers(self):
         errors = []
@@ -255,110 +278,170 @@ class RateLimiterHardeningTests(unittest.TestCase):
             rng=self.rng,
         )
 
-    def test_block_written_during_sleep_honored_after_wake(self):
-        self.limiter.wait()
-        self.limiter.record_call()
-        calls = []
-        self.clock.advance(10)
-
-        original_sleep = self.sleep
-
-        def sleep_and_block(seconds):
-            calls.append(seconds)
-            blocked_until = self.clock() + timedelta(minutes=20)
-            with open(self.state_file, "w") as f:
-                json.dump({"live_calls": [], "blocked_until": blocked_until.isoformat()}, f)
-            self.clock.advance(seconds)
-
-        self.limiter.sleep = sleep_and_block
-        with self.assertRaises(flights.RateLimited):
-            self.limiter.wait()
-        self.assertTrue(calls)
-
-    def test_concurrent_call_during_sleep_causes_recompute(self):
-        self.limiter.wait()
-        self.limiter.record_call()
-        calls = []
-        self.clock.advance(10)
-
-        other = flights.RateLimiter(
-            state_file=self.state_file,
-            lock_file=self.lock_file,
-            base_delay=45,
-            budget=None,
-            force=False,
-            clock=self.clock,
-            sleep=ListSleep(self.clock),
-            rng=SequenceRng([45]),
-        )
-
-        def sleep_and_call(seconds):
-            calls.append(seconds)
-            if len(calls) == 1:
-                other.record_call()
-            self.clock.advance(seconds)
-
-        self.limiter.sleep = sleep_and_call
-        self.limiter.wait()
-        self.limiter.record_call()
-        self.assertEqual(calls, [35.0, 10.0])
-
-    def test_force_ignores_block_during_sleep(self):
-        limiter = flights.RateLimiter(
-            state_file=self.state_file,
-            lock_file=self.lock_file,
-            base_delay=45,
-            budget=None,
-            force=True,
-            clock=self.clock,
-            sleep=self.sleep,
-            rng=SequenceRng([45]),
-        )
-        limiter.wait()
-        limiter.record_call()
-        calls = []
-        self.clock.advance(10)
-
-        def sleep_and_block(seconds):
-            calls.append(seconds)
-            blocked_until = self.clock() + timedelta(minutes=20)
-            with open(self.state_file, "w") as f:
-                json.dump(
-                    {"live_calls": [], "blocked_until": blocked_until.isoformat()},
-                    f,
-                )
-            self.clock.advance(seconds)
-
-        limiter.sleep = sleep_and_block
-        limiter.wait()
-        self.assertEqual(calls, [35.0])
-
-    def test_corrupt_cases_fail_closed(self):
-        for bad in ["{bad json", json.dumps([]), json.dumps("x")]:
-            state_file = os.path.join(self.tmp.name, f"s{hash(bad)}.json")
-            lock_file = os.path.join(self.tmp.name, f"s{hash(bad)}.lock")
+    def test_sleep_rechecks_block_and_concurrent_calls(self):
+        with self.subTest(kind="block-honored-after-sleep"):
+            clock = FakeClock()
+            state_file = os.path.join(self.tmp.name, "sleepblock.json")
+            sleep = ListSleep(clock)
             limiter = flights.RateLimiter(
                 state_file=state_file,
-                lock_file=lock_file,
+                lock_file=os.path.join(self.tmp.name, "sleepblock.lock"),
                 base_delay=45,
+                budget=None,
                 force=False,
-                clock=self.clock,
-                sleep=self.sleep,
-                rng=self.rng,
+                clock=clock,
+                sleep=sleep,
+                rng=SequenceRng([45, 45]),
             )
-            with open(state_file, "w") as f:
-                f.write(bad)
-            with self.assertRaises(flights.RateLimited) as ctx:
-                limiter.wait()
-            self.assertTrue(getattr(ctx.exception, "state_error", False))
-            self.assertEqual(self.sleep.calls, [])
+            limiter.wait()
+            limiter.record_call()
+            calls = []
+            clock.advance(10)
 
-    def test_malformed_blocked_until_fail_closed(self):
-        with open(self.state_file, "w") as f:
-            json.dump({"live_calls": [], "blocked_until": "not-a-date"}, f)
-        with self.assertRaises(flights.RateLimited) as ctx:
-            self.limiter.wait()
-        self.assertTrue(getattr(ctx.exception, "state_error", False))
+            def sleep_and_block(seconds):
+                calls.append(seconds)
+                blocked_until = clock() + timedelta(minutes=20)
+                with open(state_file, "w") as f:
+                    json.dump(
+                        {
+                            "live_calls": [],
+                            "blocked_until": blocked_until.isoformat(),
+                        },
+                        f,
+                    )
+                clock.advance(seconds)
+
+            limiter.sleep = sleep_and_block
+            with self.assertRaises(flights.RateLimited):
+                limiter.wait()
+            self.assertTrue(calls)
+        with self.subTest(kind="concurrent-call-recompute"):
+            clock = FakeClock()
+            state_file = os.path.join(self.tmp.name, "sleepcall.json")
+            sleep = ListSleep(clock)
+            limiter = flights.RateLimiter(
+                state_file=state_file,
+                lock_file=os.path.join(self.tmp.name, "sleepcall.lock"),
+                base_delay=45,
+                budget=None,
+                force=False,
+                clock=clock,
+                sleep=sleep,
+                rng=SequenceRng([45, 45]),
+            )
+            limiter.wait()
+            limiter.record_call()
+            calls = []
+            clock.advance(10)
+            other = flights.RateLimiter(
+                state_file=state_file,
+                lock_file=os.path.join(self.tmp.name, "sleepcall.lock"),
+                base_delay=45,
+                budget=None,
+                force=False,
+                clock=clock,
+                sleep=ListSleep(clock),
+                rng=SequenceRng([45]),
+            )
+
+            def sleep_and_call(seconds):
+                calls.append(seconds)
+                if len(calls) == 1:
+                    other.record_call()
+                clock.advance(seconds)
+
+            limiter.sleep = sleep_and_call
+            limiter.wait()
+            limiter.record_call()
+            self.assertEqual(calls, [35.0, 10.0])
+        with self.subTest(kind="force-ignores-block-after-sleep"):
+            clock = FakeClock()
+            state_file = os.path.join(self.tmp.name, "sleepforce.json")
+            sleep = ListSleep(clock)
+            limiter = flights.RateLimiter(
+                state_file=state_file,
+                lock_file=os.path.join(self.tmp.name, "sleepforce.lock"),
+                base_delay=45,
+                budget=None,
+                force=True,
+                clock=clock,
+                sleep=sleep,
+                rng=SequenceRng([45]),
+            )
+            limiter.wait()
+            limiter.record_call()
+            calls = []
+            clock.advance(10)
+
+            def sleep_and_block(seconds):
+                calls.append(seconds)
+                blocked_until = clock() + timedelta(minutes=20)
+                with open(state_file, "w") as f:
+                    json.dump(
+                        {
+                            "live_calls": [],
+                            "blocked_until": blocked_until.isoformat(),
+                        },
+                        f,
+                    )
+                clock.advance(seconds)
+
+            limiter.sleep = sleep_and_block
+            limiter.wait()
+            self.assertEqual(calls, [35.0])
+
+    def test_missing_empty_and_corrupt_state_fail_closed(self):
+        for name in ("missing", "empty"):
+            with self.subTest(state=name):
+                self.sleep.calls = []
+                state_file = os.path.join(self.tmp.name, f"{name}.json")
+                lock_file = os.path.join(self.tmp.name, f"{name}.lock")
+                if name == "empty":
+                    with open(state_file, "w") as f:
+                        f.write("   ")
+                limiter = flights.RateLimiter(
+                    state_file=state_file,
+                    lock_file=lock_file,
+                    base_delay=45,
+                    clock=self.clock,
+                    sleep=self.sleep,
+                    rng=SequenceRng([45]),
+                )
+                limiter.wait()
+                limiter.record_call()
+                with open(state_file) as f:
+                    state = json.load(f)
+                self.assertIn("live_calls", state)
+                self.assertIn("blocked_until", state)
+                self.assertEqual(len(state["live_calls"]), 1)
+        bad_states = ["{bad json", json.dumps([]), json.dumps("x")]
+        for idx, bad in enumerate(bad_states):
+            with self.subTest(state=f"corrupt-{idx}"):
+                self.sleep.calls = []
+                state_file = os.path.join(self.tmp.name, f"corrupt{idx}.json")
+                lock_file = os.path.join(self.tmp.name, f"corrupt{idx}.lock")
+                limiter = flights.RateLimiter(
+                    state_file=state_file,
+                    lock_file=lock_file,
+                    base_delay=45,
+                    force=False,
+                    clock=self.clock,
+                    sleep=self.sleep,
+                    rng=self.rng,
+                )
+                with open(state_file, "w") as f:
+                    f.write(bad)
+                with self.assertRaises(flights.RateLimited) as ctx:
+                    limiter.wait()
+                self.assertTrue(getattr(ctx.exception, "state_error", False))
+                self.assertEqual(self.sleep.calls, [])
+        with self.subTest(state="malformed-blocked-until"):
+            self.sleep.calls = []
+            with open(self.state_file, "w") as f:
+                json.dump({"live_calls": [], "blocked_until": "not-a-date"}, f)
+            with self.assertRaises(flights.RateLimited) as ctx:
+                self.limiter.wait()
+            self.assertTrue(getattr(ctx.exception, "state_error", False))
 
     def test_unreadable_state_raises_rate_state_error(self):
         with patch("builtins.open", side_effect=PermissionError("denied")):
@@ -432,43 +515,43 @@ class RateLimiterHardeningTests(unittest.TestCase):
             with self.assertRaises(flights.LocalStateError):
                 self.limiter.clear_block()
 
-    def test_record_block_preserves_longer_and_extends_shorter(self):
-        self.limiter.record_block(minutes=5)
-        with open(self.state_file) as f:
-            s1 = json.load(f)
-        b1 = datetime.fromisoformat(s1["blocked_until"])
-        self.limiter.record_block(minutes=20)
-        with open(self.state_file) as f:
-            s2 = json.load(f)
-        b2 = datetime.fromisoformat(s2["blocked_until"])
-        self.assertGreaterEqual(b2, b1)
-
-        self.limiter.record_block(minutes=10)
-        with open(self.state_file) as f:
-            s3 = json.load(f)
-        b3 = datetime.fromisoformat(s3["blocked_until"])
-        self.assertGreaterEqual(b3, b2)
-
-    def test_record_block_read_failure_does_not_raise(self):
-        with open(self.state_file, "w") as f:
-            f.write("{bad")
-        with patch.object(flights.log, "print") as log_print:
+    def test_record_block_merge_and_failures(self):
+        with self.subTest(kind="merge-longest"):
+            self.limiter.record_block(minutes=5)
+            with open(self.state_file) as f:
+                s1 = json.load(f)
+            b1 = datetime.fromisoformat(s1["blocked_until"])
             self.limiter.record_block(minutes=20)
-        output = " ".join(
-            str(arg) for call in log_print.call_args_list for arg in call.args
-        )
-        self.assertIn("Could not record", output)
-
-    def test_record_block_write_failure_does_not_raise(self):
-        with patch.object(
-            self.limiter, "_write_state", side_effect=OSError("disk full")
-        ):
+            with open(self.state_file) as f:
+                s2 = json.load(f)
+            b2 = datetime.fromisoformat(s2["blocked_until"])
+            self.assertGreaterEqual(b2, b1)
+            self.limiter.record_block(minutes=10)
+            with open(self.state_file) as f:
+                s3 = json.load(f)
+            b3 = datetime.fromisoformat(s3["blocked_until"])
+            self.assertGreaterEqual(b3, b2)
+        with self.subTest(kind="write-failure"):
+            with open(self.state_file, "w") as f:
+                json.dump({"live_calls": [], "blocked_until": None}, f)
+            with patch.object(
+                self.limiter, "_write_state", side_effect=OSError("disk full")
+            ):
+                with patch.object(flights.log, "print") as log_print:
+                    self.limiter.record_block(minutes=20)
+            output = " ".join(
+                str(arg) for call in log_print.call_args_list for arg in call.args
+            )
+            self.assertIn("disk full", output)
+        with self.subTest(kind="read-failure"):
+            with open(self.state_file, "w") as f:
+                f.write("{bad")
             with patch.object(flights.log, "print") as log_print:
                 self.limiter.record_block(minutes=20)
-        output = " ".join(
-            str(arg) for call in log_print.call_args_list for arg in call.args
-        )
-        self.assertIn("disk full", output)
+            output = " ".join(
+                str(arg) for call in log_print.call_args_list for arg in call.args
+            )
+            self.assertIn("Could not record", output)
 
     def test_main_clear_block_failure_exits_without_success(self):
         args = flights.parse_args([])
@@ -489,35 +572,6 @@ class RateLimiterHardeningTests(unittest.TestCase):
         )
         self.assertIn("cannot write", output)
         self.assertNotIn("cleared", output.lower())
-
-    def test_missing_and_empty_behave_as_first_run(self):
-        missing = flights.RateLimiter(
-            state_file=os.path.join(self.tmp.name, "missing2.json"),
-            lock_file=os.path.join(self.tmp.name, "missing2.lock"),
-            base_delay=45,
-            clock=self.clock,
-            sleep=self.sleep,
-            rng=self.rng,
-        )
-        missing.wait()
-        missing.record_call()
-        with open(os.path.join(self.tmp.name, "missing2.json")) as f:
-            self.assertEqual(len(json.load(f)["live_calls"]), 1)
-
-        empty = flights.RateLimiter(
-            state_file=os.path.join(self.tmp.name, "empty.json"),
-            lock_file=os.path.join(self.tmp.name, "empty.lock"),
-            base_delay=45,
-            clock=self.clock,
-            sleep=self.sleep,
-            rng=self.rng,
-        )
-        with open(os.path.join(self.tmp.name, "empty.json"), "w") as f:
-            f.write("   ")
-        empty.wait()
-        empty.record_call()
-        with open(os.path.join(self.tmp.name, "empty.json")) as f:
-            self.assertEqual(len(json.load(f)["live_calls"]), 1)
 
 
 if __name__ == "__main__":
